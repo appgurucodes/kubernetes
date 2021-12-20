@@ -19,22 +19,19 @@ package kubelet
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
+
+	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
 )
 
 func TestCreateConfigMap(t *testing.T) {
 	nodeName := "fake-node"
 	client := fake.NewSimpleClientset()
-	k8sVersionStr := constants.CurrentKubernetesVersion.String()
-	cfg := &kubeletconfig.KubeletConfiguration{}
-
 	client.PrependReactor("get", "nodes", func(action core.Action) (bool, runtime.Object, error) {
 		return true, &v1.Node{
 			ObjectMeta: metav1.ObjectMeta{
@@ -53,7 +50,12 @@ func TestCreateConfigMap(t *testing.T) {
 		return true, nil, nil
 	})
 
-	if err := CreateConfigMap(cfg, k8sVersionStr, client); err != nil {
+	internalcfg, err := configutil.DefaultedStaticInitConfiguration()
+	if err != nil {
+		t.Fatalf("unexpected failure when defaulting InitConfiguration: %v", err)
+	}
+
+	if err := CreateConfigMap(&internalcfg.ClusterConfiguration, client); err != nil {
 		t.Errorf("CreateConfigMap: unexpected error %v", err)
 	}
 }
@@ -67,7 +69,7 @@ func TestCreateConfigMapRBACRules(t *testing.T) {
 		return true, nil, nil
 	})
 
-	if err := createConfigMapRBACRules(client, version.MustParseSemantic("v1.11.0")); err != nil {
+	if err := createConfigMapRBACRules(client, version.MustParseSemantic("v1.11.0"), false); err != nil {
 		t.Errorf("createConfigMapRBACRules: unexpected error %v", err)
 	}
 }

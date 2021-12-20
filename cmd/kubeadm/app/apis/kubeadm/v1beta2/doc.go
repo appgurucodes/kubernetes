@@ -19,6 +19,8 @@ limitations under the License.
 // +k8s:deepcopy-gen=package
 // +k8s:conversion-gen=k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm
 
+// Package v1beta2 has been DEPRECATED by v1beta3
+//
 // Package v1beta2 defines the v1beta2 version of the kubeadm configuration file format.
 // This version improves on the v1beta1 format by fixing some minor issues and adding a few new fields.
 //
@@ -54,7 +56,7 @@ limitations under the License.
 //     apiVersion: kubeadm.k8s.io/v1beta2
 //     kind: ClusterConfiguration
 //
-//     apiVersion: kubelet.config.k8s.io/v1beta2
+//     apiVersion: kubelet.config.k8s.io/v1beta1
 //     kind: KubeletConfiguration
 //
 //     apiVersion: kubeproxy.config.k8s.io/v1alpha1
@@ -121,7 +123,7 @@ limitations under the License.
 // including settings for:
 //
 // - Networking, that holds configuration for the networking topology of the cluster; use it e.g. to customize
-// node subnet or services subnet.
+// pod subnet or services subnet.
 //
 // - Etcd configurations; use it e.g. to customize the local etcd or to configure the API server
 // for using an external etcd cluster.
@@ -139,14 +141,14 @@ limitations under the License.
 // See https://kubernetes.io/docs/reference/command-line-tools-reference/kube-proxy/ or https://godoc.org/k8s.io/kube-proxy/config/v1alpha1#KubeProxyConfiguration
 // for kube proxy official documentation.
 //
-//    apiVersion: kubelet.config.k8s.io/v1beta2
+//    apiVersion: kubelet.config.k8s.io/v1beta1
 //    kind: KubeletConfiguration
 //       ...
 //
 // The KubeletConfiguration type should be used to change the configurations that will be passed to all kubelet instances
 // deployed in the cluster. If this object is not provided or provided only partially, kubeadm applies defaults.
 //
-// See https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/ or https://godoc.org/k8s.io/kubelet/config/v1beta2#KubeletConfiguration
+// See https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/ or https://godoc.org/k8s.io/kubelet/config/v1beta1#KubeletConfiguration
 // for kubelet official documentation.
 //
 // Here is a fully populated example of a single YAML file containing multiple
@@ -173,7 +175,7 @@ limitations under the License.
 // 	    value: "master"
 // 	    effect: "NoSchedule"
 // 	  kubeletExtraArgs:
-// 	    cgroupDriver: "cgroupfs"
+// 	    v: 4
 //	  ignorePreflightErrors:
 //	  - IsPrivilegedUser
 // 	localAPIEndpoint:
@@ -203,8 +205,8 @@ limitations under the License.
 // 	    # certFile: "/etcd/kubernetes/pki/etcd/etcd.crt"
 // 	    # keyFile: "/etcd/kubernetes/pki/etcd/etcd.key"
 // 	networking:
-// 	  serviceSubnet: "10.96.0.0/12"
-// 	  podSubnet: "10.100.0.1/24"
+// 	  serviceSubnet: "10.96.0.0/16"
+// 	  podSubnet: "10.244.0.0/24"
 // 	  dnsDomain: "cluster.local"
 // 	kubernetesVersion: "v1.12.0"
 // 	controlPlaneEndpoint: "10.100.0.1:6443"
@@ -233,18 +235,18 @@ limitations under the License.
 // 	scheduler:
 // 	  extraArgs:
 // 	    address: "10.100.0.1"
-// 	extraVolumes:
-// 	- name: "some-volume"
-// 	  hostPath: "/etc/some-path"
-// 	  mountPath: "/etc/some-pod-path"
-// 	  readOnly: false
-// 	  pathType: File
+// 	  extraVolumes:
+// 	  - name: "some-volume"
+// 	    hostPath: "/etc/some-path"
+// 	    mountPath: "/etc/some-pod-path"
+// 	    readOnly: false
+// 	    pathType: File
 // 	certificatesDir: "/etc/kubernetes/pki"
 // 	imageRepository: "k8s.gcr.io"
 // 	useHyperKubeImage: false
 // 	clusterName: "example-cluster"
 // 	---
-// 	apiVersion: kubelet.config.k8s.io/v1beta2
+// 	apiVersion: kubelet.config.k8s.io/v1beta1
 // 	kind: KubeletConfiguration
 // 	# kubelet specific options here
 // 	---

@@ -23,15 +23,19 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"k8s.io/klog"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	netutil "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/version"
+	apimachineryversion "k8s.io/apimachinery/pkg/version"
+	componentversion "k8s.io/component-base/version"
+	"k8s.io/klog/v2"
+	netutils "k8s.io/utils/net"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
 )
@@ -40,11 +44,9 @@ import (
 func MarshalKubeadmConfigObject(obj runtime.Object) ([]byte, error) {
 	switch internalcfg := obj.(type) {
 	case *kubeadmapi.InitConfiguration:
-		return MarshalInitConfigurationToBytes(internalcfg, kubeadmapiv1beta2.SchemeGroupVersion)
-	case *kubeadmapi.ClusterConfiguration:
-		return MarshalClusterConfigurationToBytes(internalcfg, kubeadmapiv1beta2.SchemeGroupVersion)
+		return MarshalInitConfigurationToBytes(internalcfg, kubeadmapiv1.SchemeGroupVersion)
 	default:
-		return kubeadmutil.MarshalToYamlForCodecs(obj, kubeadmapiv1beta2.SchemeGroupVersion, kubeadmscheme.Codecs)
+		return kubeadmutil.MarshalToYamlForCodecs(obj, kubeadmapiv1.SchemeGroupVersion, kubeadmscheme.Codecs)
 	}
 }
 
@@ -58,14 +60,18 @@ func validateSupportedVersion(gv schema.GroupVersion, allowDeprecated bool) erro
 	// v1.13: v1alpha3 read-only, writes only v1beta1 config. Errors if the user tries to use v1alpha1 or v1alpha2
 	// v1.14: v1alpha3 convert only, writes only v1beta1 config. Errors if the user tries to use v1alpha1 or v1alpha2
 	// v1.15: v1beta1 read-only, writes only v1beta2 config. Errors if the user tries to use v1alpha1, v1alpha2 or v1alpha3
+	// v1.22: v1beta2 read-only, writes only v1beta3 config. Errors if the user tries to use v1beta1 and older
 	oldKnownAPIVersions := map[string]string{
 		"kubeadm.k8s.io/v1alpha1": "v1.11",
 		"kubeadm.k8s.io/v1alpha2": "v1.12",
 		"kubeadm.k8s.io/v1alpha3": "v1.14",
+		"kubeadm.k8s.io/v1beta1":  "v1.15",
 	}
 
 	// Deprecated API versions are supported by us, but can only be used for migration.
-	deprecatedAPIVersions := map[string]struct{}{}
+	deprecatedAPIVersions := map[string]struct{}{
+		"kubeadm.k8s.io/v1beta2": {},
+	}
 
 	gvString := gv.String()
 
@@ -74,7 +80,7 @@ func validateSupportedVersion(gv schema.GroupVersion, allowDeprecated bool) erro
 	}
 
 	if _, present := deprecatedAPIVersions[gvString]; present && !allowDeprecated {
-		return errors.Errorf("your configuration file uses a deprecated API spec: %q. Please use 'kubeadm config migrate --old-config old.yaml --new-config new.yaml', which will write the new, similar spec using a newer API version.", gv.String())
+		klog.Warningf("your configuration file uses a deprecated API spec: %q. Please use 'kubeadm config migrate --old-config old.yaml --new-config new.yaml', which will write the new, similar spec using a newer API version.", gv)
 	}
 
 	return nil
@@ -101,8 +107,23 @@ func NormalizeKubernetesVersion(cfg *kubeadmapi.ClusterConfiguration) error {
 	if err != nil {
 		return errors.Wrapf(err, "couldn't parse Kubernetes version %q", cfg.KubernetesVersion)
 	}
-	if k8sVersion.LessThan(constants.MinimumControlPlaneVersion) {
-		return errors.Errorf("this version of kubeadm only supports deploying clusters with the control plane version >= %s. Current version: %s", constants.MinimumControlPlaneVersion.String(), cfg.KubernetesVersion)
+
+	// During the k8s release process, a kubeadm version in the main branch could be 1.23.0-pre,
+	// while the 1.22.0 version is not released yet. The MinimumControlPlaneVersion validation
+	// in such a case will not pass, since the value of MinimumControlPlaneVersion would be
+	// calculated as kubeadm version - 1 (1.22) and k8sVersion would still be at 1.21.x
+	// (fetched from the 'stable' marker). Handle this case by only showing a warning.
+	mcpVersion := constants.MinimumControlPlaneVersion
+	versionInfo := componentversion.Get()
+	if isKubeadmPrereleaseVersion(&versionInfo, k8sVersion, mcpVersion) {
+		klog.V(1).Infof("WARNING: tolerating control plane version %s, assuming that k8s version %s is not released yet",
+			cfg.KubernetesVersion, mcpVersion)
+		return nil
+	}
+	// If not a pre-release version, handle the validation normally.
+	if k8sVersion.LessThan(mcpVersion) {
+		return errors.Errorf("this version of kubeadm only supports deploying clusters with the control plane version >= %s. Current version: %s",
+			mcpVersion, cfg.KubernetesVersion)
 	}
 	return nil
 }
@@ -121,9 +142,17 @@ func LowercaseSANs(sans []string) {
 // VerifyAPIServerBindAddress can be used to verify if a bind address for the API Server is 0.0.0.0,
 // in which case this address is not valid and should not be used.
 func VerifyAPIServerBindAddress(address string) error {
-	ip := net.ParseIP(address)
+	ip := netutils.ParseIPSloppy(address)
 	if ip == nil {
 		return errors.Errorf("cannot parse IP address: %s", address)
+	}
+	// There are users with network setups where default routes are present, but network interfaces
+	// use only link-local addresses (e.g. as described in RFC5549).
+	// In many cases that matching global unicast IP address can be found on loopback interface,
+	// so kubeadm allows users to specify address=Loopback for handling supporting the scenario above.
+	// Nb. SetAPIEndpointDynamicDefaults will try to translate loopback to a valid address afterwards
+	if ip.IsLoopback() {
+		return nil
 	}
 	if !ip.IsGlobalUnicast() {
 		return errors.Errorf("cannot use %q as the bind address for the API Server", address)
@@ -131,14 +160,14 @@ func VerifyAPIServerBindAddress(address string) error {
 	return nil
 }
 
-// ChooseAPIServerBindAddress is a wrapper for netutil.ChooseBindAddress that also handles
-// the case where no default routes were found and an IP for the API server could not be obatained.
+// ChooseAPIServerBindAddress is a wrapper for netutil.ResolveBindAddress that also handles
+// the case where no default routes were found and an IP for the API server could not be obtained.
 func ChooseAPIServerBindAddress(bindAddress net.IP) (net.IP, error) {
-	ip, err := netutil.ChooseBindAddress(bindAddress)
+	ip, err := netutil.ResolveBindAddress(bindAddress)
 	if err != nil {
 		if netutil.IsNoRoutesError(err) {
 			klog.Warningf("WARNING: could not obtain a bind address for the API Server: %v; using: %s", err, constants.DefaultAPIServerBindAddress)
-			defaultIP := net.ParseIP(constants.DefaultAPIServerBindAddress)
+			defaultIP := netutils.ParseIPSloppy(constants.DefaultAPIServerBindAddress)
 			if defaultIP == nil {
 				return nil, errors.Errorf("cannot parse default IP address: %s", constants.DefaultAPIServerBindAddress)
 			}
@@ -194,4 +223,21 @@ func MigrateOldConfig(oldConfig []byte) ([]byte, error) {
 	}
 
 	return bytes.Join(newConfig, []byte(constants.YAMLDocumentSeparator)), nil
+}
+
+// isKubeadmPrereleaseVersion returns true if the kubeadm version is a pre-release version and
+// the minimum control plane version is N+2 MINOR version of the given k8sVersion.
+func isKubeadmPrereleaseVersion(versionInfo *apimachineryversion.Info, k8sVersion, mcpVersion *version.Version) bool {
+	if len(versionInfo.Major) != 0 { // Make sure the component version is populated
+		kubeadmVersion := version.MustParseSemantic(versionInfo.String())
+		if len(kubeadmVersion.PreRelease()) != 0 { // Only handle this if the kubeadm binary is a pre-release
+			// After incrementing the k8s MINOR version by one, if this version is equal or greater than the
+			// MCP version, return true.
+			v := k8sVersion.WithMinor(k8sVersion.Minor() + 1)
+			if comp, _ := v.Compare(mcpVersion.String()); comp != -1 {
+				return true
+			}
+		}
+	}
+	return false
 }

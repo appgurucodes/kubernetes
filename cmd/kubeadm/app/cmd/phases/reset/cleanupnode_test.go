@@ -22,10 +22,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
+
+	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
 )
 
 func assertExists(t *testing.T, path string) {
@@ -197,12 +198,12 @@ func TestConfigDirCleaner(t *testing.T) {
 
 func TestRemoveContainers(t *testing.T) {
 	fcmd := fakeexec.FakeCmd{
-		CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
-			func() ([]byte, error) { return []byte("id1\nid2"), nil },
-			func() ([]byte, error) { return []byte(""), nil },
-			func() ([]byte, error) { return []byte(""), nil },
-			func() ([]byte, error) { return []byte(""), nil },
-			func() ([]byte, error) { return []byte(""), nil },
+		CombinedOutputScript: []fakeexec.FakeAction{
+			func() ([]byte, []byte, error) { return []byte("id1\nid2"), nil, nil },
+			func() ([]byte, []byte, error) { return []byte(""), nil, nil },
+			func() ([]byte, []byte, error) { return []byte(""), nil, nil },
+			func() ([]byte, []byte, error) { return []byte(""), nil, nil },
+			func() ([]byte, []byte, error) { return []byte(""), nil, nil },
 		},
 	}
 	fexec := fakeexec.FakeExec{

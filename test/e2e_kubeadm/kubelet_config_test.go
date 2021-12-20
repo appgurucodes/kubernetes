@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_kubeadm
+package kubeadm
 
 import (
 	"fmt"
@@ -24,8 +24,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/kubernetes/test/e2e/framework"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo"
+	"github.com/onsi/gomega"
 )
 
 const (
@@ -48,7 +48,7 @@ var (
 // Define container for all the test specification aimed at verifying
 // that kubeadm creates the kubelet-config ConfigMap, that it is properly configured
 // and that all the related RBAC rules are in place
-var _ = KubeadmDescribe("kubelet-config ConfigMap", func() {
+var _ = Describe("kubelet-config ConfigMap", func() {
 
 	// Get an instance of the k8s test framework
 	f := framework.NewDefaultFramework("kubelet-config")
@@ -59,7 +59,7 @@ var _ = KubeadmDescribe("kubelet-config ConfigMap", func() {
 
 	// kubelet-config map is named using the kubernetesVersion as a suffix, and so
 	// it is necessary to get it from the kubeadm-config ConfigMap before testing
-	BeforeEach(func() {
+	ginkgo.BeforeEach(func() {
 		// if the kubelet-config map name is already known exit
 		if kubeletConfigConfigMapName != "" {
 			return
@@ -69,39 +69,68 @@ var _ = KubeadmDescribe("kubelet-config ConfigMap", func() {
 		m := getClusterConfiguration(f.ClientSet)
 
 		// Extract the kubernetesVersion
-		Expect(m).To(HaveKey("kubernetesVersion"))
+		// TODO: remove this after the UnversionedKubeletConfigMap feature gate goes GA:
+		// https://github.com/kubernetes/kubeadm/issues/1582
+		// At that point parsing the k8s version will no longer be needed in this test.
+		gomega.Expect(m).To(gomega.HaveKey("kubernetesVersion"))
 		k8sVersionString := m["kubernetesVersion"].(string)
 		k8sVersion, err := version.ParseSemantic(k8sVersionString)
 		if err != nil {
 			framework.Failf("error reading kubernetesVersion from %s ConfigMap: %v", kubeadmConfigName, err)
 		}
 
+		// Extract the value of the UnversionedKubeletConfigMap feature gate if its present.
+		// TODO: remove this after the UnversionedKubeletConfigMap feature gate goes GA:
+		// https://github.com/kubernetes/kubeadm/issues/1582
+		var UnversionedKubeletConfigMap bool
+		if _, ok := m["featureGates"]; ok {
+			if featureGates, ok := m["featureGates"].(map[interface{}]interface{}); ok {
+				// TODO: update the default to true once this graduates to Beta.
+				UnversionedKubeletConfigMap = false
+				if val, ok := featureGates["UnversionedKubeletConfigMap"]; ok {
+					if valBool, ok := val.(bool); ok {
+						UnversionedKubeletConfigMap = valBool
+					} else {
+						framework.Failf("unable to cast the value of feature gate UnversionedKubeletConfigMap to bool")
+					}
+				}
+			} else {
+				framework.Failf("unable to cast the featureGates field in the %s ConfigMap", kubeadmConfigName)
+			}
+		}
+
 		// Computes all the names derived from the kubernetesVersion
-		kubeletConfigConfigMapName = fmt.Sprintf("kubelet-config-%d.%d", k8sVersion.Major(), k8sVersion.Minor())
-		kubeletConfigRoleName = fmt.Sprintf("kubeadm:kubelet-config-%d.%d", k8sVersion.Major(), k8sVersion.Minor())
+		kubeletConfigConfigMapName = "kubelet-config"
+		kubeletConfigRoleName = "kubeadm:kubelet-config"
+		// TODO: remove this after the UnversionedKubeletConfigMap feature gate goes GA:
+		// https://github.com/kubernetes/kubeadm/issues/1582
+		if !UnversionedKubeletConfigMap {
+			kubeletConfigConfigMapName = fmt.Sprintf("kubelet-config-%d.%d", k8sVersion.Major(), k8sVersion.Minor())
+			kubeletConfigRoleName = fmt.Sprintf("kubeadm:kubelet-config-%d.%d", k8sVersion.Major(), k8sVersion.Minor())
+		}
 		kubeletConfigRoleBindingName = kubeletConfigRoleName
 		kubeletConfigConfigMapResource.Name = kubeletConfigConfigMapName
 	})
 
-	It("should exist and be properly configured", func() {
+	ginkgo.It("should exist and be properly configured", func() {
 		cm := GetConfigMap(f.ClientSet, kubeSystemNamespace, kubeletConfigConfigMapName)
 
-		Expect(cm.Data).To(HaveKey(kubeletConfigConfigMapKey))
+		gomega.Expect(cm.Data).To(gomega.HaveKey(kubeletConfigConfigMapKey))
 	})
 
-	It("should have related Role and RoleBinding", func() {
+	ginkgo.It("should have related Role and RoleBinding", func() {
 		ExpectRole(f.ClientSet, kubeSystemNamespace, kubeletConfigRoleName)
 		ExpectRoleBinding(f.ClientSet, kubeSystemNamespace, kubeletConfigRoleBindingName)
 	})
 
-	It("should be accessible for bootstrap tokens", func() {
+	ginkgo.It("should be accessible for bootstrap tokens", func() {
 		ExpectSubjectHasAccessToResource(f.ClientSet,
 			rbacv1.GroupKind, bootstrapTokensGroup,
 			kubeadmConfigConfigMapResource,
 		)
 	})
 
-	It("should be accessible for nodes", func() {
+	ginkgo.It("should be accessible for nodes", func() {
 		ExpectSubjectHasAccessToResource(f.ClientSet,
 			rbacv1.GroupKind, nodesGroup,
 			kubeadmConfigConfigMapResource,

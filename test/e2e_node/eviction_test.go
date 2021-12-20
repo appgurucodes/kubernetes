@@ -14,34 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"k8s.io/api/core/v1"
-	schedulerapi "k8s.io/api/scheduling/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	kubeletstatsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
-	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
 	kubeletmetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/test/e2e/framework"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	testutils "k8s.io/kubernetes/test/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo"
+	"github.com/onsi/gomega"
 )
 
 // Eviction Policy is described here:
@@ -50,7 +51,7 @@ import (
 const (
 	postTestConditionMonitoringPeriod = 1 * time.Minute
 	evictionPollInterval              = 2 * time.Second
-	pressureDissapearTimeout          = 1 * time.Minute
+	pressureDisappearTimeout          = 10 * time.Minute
 	// pressure conditions often surface after evictions because the kubelet only updates
 	// node conditions periodically.
 	// we wait this period after evictions to make sure that we wait out this delay
@@ -65,19 +66,19 @@ const (
 
 // InodeEviction tests that the node responds to node disk pressure by evicting only responsible pods.
 // Node disk pressure is induced by consuming all inodes on the node.
-var _ = framework.KubeDescribe("InodeEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("InodeEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("inode-eviction-test")
 	expectedNodeCondition := v1.NodeDiskPressure
 	expectedStarvedResource := resourceInodes
 	pressureTimeout := 15 * time.Minute
 	inodesConsumed := uint64(200000)
-	Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
 			// Set the eviction threshold to inodesFree - inodesConsumed, so that using inodesConsumed causes an eviction.
 			summary := eventuallyGetSummary()
 			inodesFree := *summary.Node.Fs.InodesFree
 			if inodesFree <= inodesConsumed {
-				framework.Skipf("Too few inodes free on the host for the InodeEviction test to run")
+				e2eskipper.Skipf("Too few inodes free on the host for the InodeEviction test to run")
 			}
 			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalNodeFsInodesFree): fmt.Sprintf("%d", inodesFree-inodesConsumed)}
 			initialConfig.EvictionMinimumReclaim = map[string]string{}
@@ -101,19 +102,19 @@ var _ = framework.KubeDescribe("InodeEviction [Slow] [Serial] [Disruptive][NodeF
 
 // ImageGCNoEviction tests that the node does not evict pods when inodes are consumed by images
 // Disk pressure is induced by pulling large images
-var _ = framework.KubeDescribe("ImageGCNoEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("ImageGCNoEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("image-gc-eviction-test")
 	pressureTimeout := 10 * time.Minute
 	expectedNodeCondition := v1.NodeDiskPressure
 	expectedStarvedResource := resourceInodes
 	inodesConsumed := uint64(100000)
-	Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
 			// Set the eviction threshold to inodesFree - inodesConsumed, so that using inodesConsumed causes an eviction.
 			summary := eventuallyGetSummary()
 			inodesFree := *summary.Node.Fs.InodesFree
 			if inodesFree <= inodesConsumed {
-				framework.Skipf("Too few inodes free on the host for the InodeEviction test to run")
+				e2eskipper.Skipf("Too few inodes free on the host for the InodeEviction test to run")
 			}
 			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalNodeFsInodesFree): fmt.Sprintf("%d", inodesFree-inodesConsumed)}
 			initialConfig.EvictionMinimumReclaim = map[string]string{}
@@ -131,12 +132,12 @@ var _ = framework.KubeDescribe("ImageGCNoEviction [Slow] [Serial] [Disruptive][N
 
 // MemoryAllocatableEviction tests that the node responds to node memory pressure by evicting only responsible pods.
 // Node memory pressure is only encountered because we reserve the majority of the node's capacity via kube-reserved.
-var _ = framework.KubeDescribe("MemoryAllocatableEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("MemoryAllocatableEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("memory-allocatable-eviction-test")
 	expectedNodeCondition := v1.NodeMemoryPressure
 	expectedStarvedResource := v1.ResourceMemory
 	pressureTimeout := 10 * time.Minute
-	Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
 			// Set large system and kube reserved values to trigger allocatable thresholds far before hard eviction thresholds.
 			kubeReserved := getNodeCPUAndMemoryCapacity(f)[v1.ResourceMemory]
@@ -164,19 +165,28 @@ var _ = framework.KubeDescribe("MemoryAllocatableEviction [Slow] [Serial] [Disru
 
 // LocalStorageEviction tests that the node responds to node disk pressure by evicting only responsible pods
 // Disk pressure is induced by running pods which consume disk space.
-var _ = framework.KubeDescribe("LocalStorageEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("LocalStorageEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("localstorage-eviction-test")
-	pressureTimeout := 10 * time.Minute
+	pressureTimeout := 15 * time.Minute
 	expectedNodeCondition := v1.NodeDiskPressure
 	expectedStarvedResource := v1.ResourceEphemeralStorage
-	Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
-			diskConsumed := resource.MustParse("200Mi")
 			summary := eventuallyGetSummary()
-			availableBytes := *(summary.Node.Fs.AvailableBytes)
-			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalNodeFsAvailable): fmt.Sprintf("%d", availableBytes-uint64(diskConsumed.Value()))}
+
+			diskConsumedByTest := resource.MustParse("4Gi")
+			availableBytesOnSystem := *(summary.Node.Fs.AvailableBytes)
+			evictionThreshold := strconv.FormatUint(availableBytesOnSystem-uint64(diskConsumedByTest.Value()), 10)
+
+			if availableBytesOnSystem <= uint64(diskConsumedByTest.Value()) {
+				e2eskipper.Skipf("Too little disk free on the host for the LocalStorageEviction test to run")
+			}
+
+			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalNodeFsAvailable): evictionThreshold}
 			initialConfig.EvictionMinimumReclaim = map[string]string{}
 		})
+
 		runEvictionTest(f, pressureTimeout, expectedNodeCondition, expectedStarvedResource, logDiskMetrics, []podEvictSpec{
 			{
 				evictionPriority: 1,
@@ -193,18 +203,18 @@ var _ = framework.KubeDescribe("LocalStorageEviction [Slow] [Serial] [Disruptive
 // LocalStorageEviction tests that the node responds to node disk pressure by evicting only responsible pods
 // Disk pressure is induced by running pods which consume disk space, which exceed the soft eviction threshold.
 // Note: This test's purpose is to test Soft Evictions.  Local storage was chosen since it is the least costly to run.
-var _ = framework.KubeDescribe("LocalStorageSoftEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("LocalStorageSoftEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("localstorage-eviction-test")
 	pressureTimeout := 10 * time.Minute
 	expectedNodeCondition := v1.NodeDiskPressure
 	expectedStarvedResource := v1.ResourceEphemeralStorage
-	Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
-			diskConsumed := resource.MustParse("200Mi")
+			diskConsumed := resource.MustParse("4Gi")
 			summary := eventuallyGetSummary()
 			availableBytes := *(summary.Node.Fs.AvailableBytes)
 			if availableBytes <= uint64(diskConsumed.Value()) {
-				framework.Skipf("Too little disk free on the host for the LocalStorageSoftEviction test to run")
+				e2eskipper.Skipf("Too little disk free on the host for the LocalStorageSoftEviction test to run")
 			}
 			initialConfig.EvictionSoft = map[string]string{string(evictionapi.SignalNodeFsAvailable): fmt.Sprintf("%d", availableBytes-uint64(diskConsumed.Value()))}
 			initialConfig.EvictionSoftGracePeriod = map[string]string{string(evictionapi.SignalNodeFsAvailable): "1m"}
@@ -228,11 +238,52 @@ var _ = framework.KubeDescribe("LocalStorageSoftEviction [Slow] [Serial] [Disrup
 	})
 })
 
+// This test validates that in-memory EmptyDir's are evicted when the Kubelet does
+// not have Sized Memory Volumes enabled. When Sized volumes are enabled, it's
+// not possible to exhaust the quota.
+var _ = SIGDescribe("LocalStorageCapacityIsolationMemoryBackedVolumeEviction [Slow] [Serial] [Disruptive] [Feature:LocalStorageCapacityIsolation][NodeFeature:Eviction]", func() {
+	f := framework.NewDefaultFramework("localstorage-eviction-test")
+	evictionTestTimeout := 7 * time.Minute
+	ginkgo.Context(fmt.Sprintf(testContextFmt, "evictions due to pod local storage violations"), func() {
+		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
+			// setting a threshold to 0% disables; non-empty map overrides default value (necessary due to omitempty)
+			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalMemoryAvailable): "0%"}
+			initialConfig.FeatureGates["SizeMemoryBackedVolumes"] = false
+		})
+
+		sizeLimit := resource.MustParse("100Mi")
+		useOverLimit := 200 /* Mb */
+		useUnderLimit := 80 /* Mb */
+		containerLimit := v1.ResourceList{v1.ResourceEphemeralStorage: sizeLimit}
+
+		runEvictionTest(f, evictionTestTimeout, noPressure, noStarvedResource, logDiskMetrics, []podEvictSpec{
+			{
+				evictionPriority: 1, // Should be evicted due to disk limit
+				pod: diskConsumingPod("emptydir-memory-over-volume-sizelimit", useOverLimit, &v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{Medium: "Memory", SizeLimit: &sizeLimit},
+				}, v1.ResourceRequirements{}),
+			},
+			{
+				evictionPriority: 0, // Should not be evicted, as container limits do not account for memory backed volumes
+				pod: diskConsumingPod("emptydir-memory-over-container-sizelimit", useOverLimit, &v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{Medium: "Memory"},
+				}, v1.ResourceRequirements{Limits: containerLimit}),
+			},
+			{
+				evictionPriority: 0,
+				pod: diskConsumingPod("emptydir-memory-innocent", useUnderLimit, &v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{Medium: "Memory", SizeLimit: &sizeLimit},
+				}, v1.ResourceRequirements{}),
+			},
+		})
+	})
+})
+
 // LocalStorageCapacityIsolationEviction tests that container and volume local storage limits are enforced through evictions
-var _ = framework.KubeDescribe("LocalStorageCapacityIsolationEviction [Slow] [Serial] [Disruptive] [Feature:LocalStorageCapacityIsolation][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("LocalStorageCapacityIsolationEviction [Slow] [Serial] [Disruptive] [Feature:LocalStorageCapacityIsolation][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("localstorage-eviction-test")
 	evictionTestTimeout := 10 * time.Minute
-	Context(fmt.Sprintf(testContextFmt, "evictions due to pod local storage violations"), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, "evictions due to pod local storage violations"), func() {
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
 			// setting a threshold to 0% disables; non-empty map overrides default value (necessary due to omitempty)
 			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalMemoryAvailable): "0%"}
@@ -250,12 +301,6 @@ var _ = framework.KubeDescribe("LocalStorageCapacityIsolationEviction [Slow] [Se
 				}, v1.ResourceRequirements{}),
 			},
 			{
-				evictionPriority: 1, // This pod should be evicted because of memory emptyDir usage violation
-				pod: diskConsumingPod("emptydir-memory-sizelimit", useOverLimit, &v1.VolumeSource{
-					EmptyDir: &v1.EmptyDirVolumeSource{Medium: "Memory", SizeLimit: &sizeLimit},
-				}, v1.ResourceRequirements{}),
-			},
-			{
 				evictionPriority: 1, // This pod should cross the container limit by writing to its writable layer.
 				pod:              diskConsumingPod("container-disk-limit", useOverLimit, nil, v1.ResourceRequirements{Limits: containerLimit}),
 			},
@@ -263,6 +308,12 @@ var _ = framework.KubeDescribe("LocalStorageCapacityIsolationEviction [Slow] [Se
 				evictionPriority: 1, // This pod should hit the container limit by writing to an emptydir
 				pod: diskConsumingPod("container-emptydir-disk-limit", useOverLimit, &v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}},
 					v1.ResourceRequirements{Limits: containerLimit}),
+			},
+			{
+				evictionPriority: 0, // This pod should not be evicted because MemoryBackedVolumes cannot use more space than is allocated to them since SizeMemoryBackedVolumes was enabled
+				pod: diskConsumingPod("emptydir-memory-sizelimit", useOverLimit, &v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{Medium: "Memory", SizeLimit: &sizeLimit},
+				}, v1.ResourceRequirements{}),
 			},
 			{
 				evictionPriority: 0, // This pod should not be evicted because it uses less than its limit
@@ -281,7 +332,7 @@ var _ = framework.KubeDescribe("LocalStorageCapacityIsolationEviction [Slow] [Se
 // PriorityMemoryEvictionOrdering tests that the node responds to node memory pressure by evicting pods.
 // This test tests that the guaranteed pod is never evicted, and that the lower-priority pod is evicted before
 // the higher priority pod.
-var _ = framework.KubeDescribe("PriorityMemoryEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("PriorityMemoryEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("priority-memory-eviction-ordering-test")
 	expectedNodeCondition := v1.NodeMemoryPressure
 	expectedStarvedResource := v1.ResourceMemory
@@ -290,24 +341,24 @@ var _ = framework.KubeDescribe("PriorityMemoryEvictionOrdering [Slow] [Serial] [
 	highPriorityClassName := f.BaseName + "-high-priority"
 	highPriority := int32(999999999)
 
-	Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
 			memoryConsumed := resource.MustParse("600Mi")
 			summary := eventuallyGetSummary()
 			availableBytes := *(summary.Node.Memory.AvailableBytes)
 			if availableBytes <= uint64(memoryConsumed.Value()) {
-				framework.Skipf("Too little memory free on the host for the PriorityMemoryEvictionOrdering test to run")
+				e2eskipper.Skipf("Too little memory free on the host for the PriorityMemoryEvictionOrdering test to run")
 			}
 			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalMemoryAvailable): fmt.Sprintf("%d", availableBytes-uint64(memoryConsumed.Value()))}
 			initialConfig.EvictionMinimumReclaim = map[string]string{}
 		})
-		BeforeEach(func() {
-			_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(&schedulerapi.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: highPriorityClassName}, Value: highPriority})
-			Expect(err == nil || errors.IsAlreadyExists(err)).To(BeTrue())
+		ginkgo.BeforeEach(func() {
+			_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: highPriorityClassName}, Value: highPriority}, metav1.CreateOptions{})
+			framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
 		})
-		AfterEach(func() {
-			err := f.ClientSet.SchedulingV1().PriorityClasses().Delete(highPriorityClassName, &metav1.DeleteOptions{})
-			Expect(err).NotTo(HaveOccurred())
+		ginkgo.AfterEach(func() {
+			err := f.ClientSet.SchedulingV1().PriorityClasses().Delete(context.TODO(), highPriorityClassName, metav1.DeleteOptions{})
+			framework.ExpectNoError(err)
 		})
 		specs := []podEvictSpec{
 			{
@@ -338,33 +389,33 @@ var _ = framework.KubeDescribe("PriorityMemoryEvictionOrdering [Slow] [Serial] [
 // PriorityLocalStorageEvictionOrdering tests that the node responds to node disk pressure by evicting pods.
 // This test tests that the guaranteed pod is never evicted, and that the lower-priority pod is evicted before
 // the higher priority pod.
-var _ = framework.KubeDescribe("PriorityLocalStorageEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("PriorityLocalStorageEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("priority-disk-eviction-ordering-test")
 	expectedNodeCondition := v1.NodeDiskPressure
 	expectedStarvedResource := v1.ResourceEphemeralStorage
-	pressureTimeout := 10 * time.Minute
+	pressureTimeout := 15 * time.Minute
 
 	highPriorityClassName := f.BaseName + "-high-priority"
 	highPriority := int32(999999999)
 
-	Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
-			diskConsumed := resource.MustParse("350Mi")
+			diskConsumed := resource.MustParse("4Gi")
 			summary := eventuallyGetSummary()
 			availableBytes := *(summary.Node.Fs.AvailableBytes)
 			if availableBytes <= uint64(diskConsumed.Value()) {
-				framework.Skipf("Too little disk free on the host for the PriorityLocalStorageEvictionOrdering test to run")
+				e2eskipper.Skipf("Too little disk free on the host for the PriorityLocalStorageEvictionOrdering test to run")
 			}
 			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalNodeFsAvailable): fmt.Sprintf("%d", availableBytes-uint64(diskConsumed.Value()))}
 			initialConfig.EvictionMinimumReclaim = map[string]string{}
 		})
-		BeforeEach(func() {
-			_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(&schedulerapi.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: highPriorityClassName}, Value: highPriority})
-			Expect(err == nil || errors.IsAlreadyExists(err)).To(BeTrue())
+		ginkgo.BeforeEach(func() {
+			_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: highPriorityClassName}, Value: highPriority}, metav1.CreateOptions{})
+			framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
 		})
-		AfterEach(func() {
-			err := f.ClientSet.SchedulingV1().PriorityClasses().Delete(highPriorityClassName, &metav1.DeleteOptions{})
-			Expect(err).NotTo(HaveOccurred())
+		ginkgo.AfterEach(func() {
+			err := f.ClientSet.SchedulingV1().PriorityClasses().Delete(context.TODO(), highPriorityClassName, metav1.DeleteOptions{})
+			framework.ExpectNoError(err)
 		})
 		specs := []podEvictSpec{
 			{
@@ -394,7 +445,7 @@ var _ = framework.KubeDescribe("PriorityLocalStorageEvictionOrdering [Slow] [Ser
 })
 
 // PriorityPidEvictionOrdering tests that the node emits pid pressure in response to a fork bomb, and evicts pods by priority
-var _ = framework.KubeDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
 	f := framework.NewDefaultFramework("pidpressure-eviction-test")
 	pressureTimeout := 2 * time.Minute
 	expectedNodeCondition := v1.NodePIDPressure
@@ -403,7 +454,7 @@ var _ = framework.KubeDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Dis
 	highPriorityClassName := f.BaseName + "-high-priority"
 	highPriority := int32(999999999)
 
-	Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
 		tempSetCurrentKubeletConfig(f, func(initialConfig *kubeletconfig.KubeletConfiguration) {
 			pidsConsumed := int64(10000)
 			summary := eventuallyGetSummary()
@@ -411,25 +462,30 @@ var _ = framework.KubeDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Dis
 			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalPIDAvailable): fmt.Sprintf("%d", availablePids-pidsConsumed)}
 			initialConfig.EvictionMinimumReclaim = map[string]string{}
 		})
-		BeforeEach(func() {
-			_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(&schedulerapi.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: highPriorityClassName}, Value: highPriority})
-			Expect(err == nil || errors.IsAlreadyExists(err)).To(BeTrue())
+		ginkgo.BeforeEach(func() {
+			_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: highPriorityClassName}, Value: highPriority}, metav1.CreateOptions{})
+			framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
 		})
-		AfterEach(func() {
-			err := f.ClientSet.SchedulingV1().PriorityClasses().Delete(highPriorityClassName, &metav1.DeleteOptions{})
-			Expect(err).NotTo(HaveOccurred())
+		ginkgo.AfterEach(func() {
+			err := f.ClientSet.SchedulingV1().PriorityClasses().Delete(context.TODO(), highPriorityClassName, metav1.DeleteOptions{})
+			framework.ExpectNoError(err)
 		})
 		specs := []podEvictSpec{
 			{
-				evictionPriority: 1,
-				pod:              pidConsumingPod("fork-bomb-container", 12000),
+				evictionPriority: 2,
+				pod:              pidConsumingPod("fork-bomb-container-with-low-priority", 12000),
 			},
 			{
 				evictionPriority: 0,
 				pod:              innocentPod(),
 			},
+			{
+				evictionPriority: 1,
+				pod:              pidConsumingPod("fork-bomb-container-with-high-priority", 12000),
+			},
 		}
 		specs[1].pod.Spec.PriorityClassName = highPriorityClassName
+		specs[2].pod.Spec.PriorityClassName = highPriorityClassName
 		runEvictionTest(f, pressureTimeout, expectedNodeCondition, expectedStarvedResource, logPidMetrics, specs)
 	})
 })
@@ -451,14 +507,14 @@ type podEvictSpec struct {
 // runEvictionTest then cleans up the testing environment by deleting provided pods, and ensures that expectedNodeCondition no longer exists
 func runEvictionTest(f *framework.Framework, pressureTimeout time.Duration, expectedNodeCondition v1.NodeConditionType, expectedStarvedResource v1.ResourceName, logFunc func(), testSpecs []podEvictSpec) {
 	// Place the remainder of the test within a context so that the kubelet config is set before and after the test.
-	Context("", func() {
-		BeforeEach(func() {
+	ginkgo.Context("", func() {
+		ginkgo.BeforeEach(func() {
 			// reduce memory usage in the allocatable cgroup to ensure we do not have MemoryPressure
-			reduceAllocatableMemoryUsage()
+			reduceAllocatableMemoryUsageIfCgroupv1()
 			// Nodes do not immediately report local storage capacity
 			// Sleep so that pods requesting local storage do not fail to schedule
 			time.Sleep(30 * time.Second)
-			By("seting up pods to be used by tests")
+			ginkgo.By("setting up pods to be used by tests")
 			pods := []*v1.Pod{}
 			for _, spec := range testSpecs {
 				pods = append(pods, spec.pod)
@@ -466,73 +522,101 @@ func runEvictionTest(f *framework.Framework, pressureTimeout time.Duration, expe
 			f.PodClient().CreateBatch(pods)
 		})
 
-		It("should eventually evict all of the correct pods", func() {
-			By(fmt.Sprintf("Waiting for node to have NodeCondition: %s", expectedNodeCondition))
-			Eventually(func() error {
+		ginkgo.It("should eventually evict all of the correct pods", func() {
+			ginkgo.By(fmt.Sprintf("Waiting for node to have NodeCondition: %s", expectedNodeCondition))
+			gomega.Eventually(func() error {
 				logFunc()
 				if expectedNodeCondition == noPressure || hasNodeCondition(f, expectedNodeCondition) {
 					return nil
 				}
 				return fmt.Errorf("NodeCondition: %s not encountered", expectedNodeCondition)
-			}, pressureTimeout, evictionPollInterval).Should(BeNil())
+			}, pressureTimeout, evictionPollInterval).Should(gomega.BeNil())
 
-			By("Waiting for evictions to occur")
-			Eventually(func() error {
+			ginkgo.By("Waiting for evictions to occur")
+			gomega.Eventually(func() error {
 				if expectedNodeCondition != noPressure {
 					if hasNodeCondition(f, expectedNodeCondition) {
-						e2elog.Logf("Node has %s", expectedNodeCondition)
+						framework.Logf("Node has %s", expectedNodeCondition)
 					} else {
-						e2elog.Logf("Node does NOT have %s", expectedNodeCondition)
+						framework.Logf("Node does NOT have %s", expectedNodeCondition)
 					}
 				}
 				logKubeletLatencyMetrics(kubeletmetrics.EvictionStatsAgeKey)
 				logFunc()
 				return verifyEvictionOrdering(f, testSpecs)
-			}, pressureTimeout, evictionPollInterval).Should(BeNil())
+			}, pressureTimeout, evictionPollInterval).Should(gomega.BeNil())
 
 			// We observe pressure from the API server.  The eviction manager observes pressure from the kubelet internal stats.
 			// This means the eviction manager will observe pressure before we will, creating a delay between when the eviction manager
 			// evicts a pod, and when we observe the pressure by querying the API server.  Add a delay here to account for this delay
-			By("making sure pressure from test has surfaced before continuing")
+			ginkgo.By("making sure pressure from test has surfaced before continuing")
 			time.Sleep(pressureDelay)
 
-			By(fmt.Sprintf("Waiting for NodeCondition: %s to no longer exist on the node", expectedNodeCondition))
-			Eventually(func() error {
+			ginkgo.By(fmt.Sprintf("Waiting for NodeCondition: %s to no longer exist on the node", expectedNodeCondition))
+			gomega.Eventually(func() error {
 				logFunc()
 				logKubeletLatencyMetrics(kubeletmetrics.EvictionStatsAgeKey)
 				if expectedNodeCondition != noPressure && hasNodeCondition(f, expectedNodeCondition) {
-					return fmt.Errorf("Conditions havent returned to normal, node still has %s", expectedNodeCondition)
+					return fmt.Errorf("Conditions haven't returned to normal, node still has %s", expectedNodeCondition)
 				}
 				return nil
-			}, pressureDissapearTimeout, evictionPollInterval).Should(BeNil())
+			}, pressureDisappearTimeout, evictionPollInterval).Should(gomega.BeNil())
 
-			By("checking for stable, pressure-free condition without unexpected pod failures")
-			Consistently(func() error {
+			ginkgo.By("checking for stable, pressure-free condition without unexpected pod failures")
+			gomega.Consistently(func() error {
 				if expectedNodeCondition != noPressure && hasNodeCondition(f, expectedNodeCondition) {
-					return fmt.Errorf("%s dissappeared and then reappeared", expectedNodeCondition)
+					return fmt.Errorf("%s disappeared and then reappeared", expectedNodeCondition)
 				}
 				logFunc()
 				logKubeletLatencyMetrics(kubeletmetrics.EvictionStatsAgeKey)
 				return verifyEvictionOrdering(f, testSpecs)
-			}, postTestConditionMonitoringPeriod, evictionPollInterval).Should(BeNil())
+			}, postTestConditionMonitoringPeriod, evictionPollInterval).Should(gomega.BeNil())
 
-			By("checking for correctly formatted eviction events")
+			ginkgo.By("checking for correctly formatted eviction events")
 			verifyEvictionEvents(f, testSpecs, expectedStarvedResource)
 		})
 
-		AfterEach(func() {
-			By("deleting pods")
+		ginkgo.AfterEach(func() {
+			prePullImagesIfNeccecary := func() {
+				if expectedNodeCondition == v1.NodeDiskPressure && framework.TestContext.PrepullImages {
+					// The disk eviction test may cause the prepulled images to be evicted,
+					// prepull those images again to ensure this test not affect following tests.
+					PrePullAllImages()
+				}
+			}
+			// Run prePull using a defer to make sure it is executed even when the assertions below fails
+			defer prePullImagesIfNeccecary()
+
+			ginkgo.By("deleting pods")
 			for _, spec := range testSpecs {
-				By(fmt.Sprintf("deleting pod: %s", spec.pod.Name))
-				f.PodClient().DeleteSync(spec.pod.Name, &metav1.DeleteOptions{}, 10*time.Minute)
+				ginkgo.By(fmt.Sprintf("deleting pod: %s", spec.pod.Name))
+				f.PodClient().DeleteSync(spec.pod.Name, metav1.DeleteOptions{}, 10*time.Minute)
 			}
-			reduceAllocatableMemoryUsage()
-			if expectedNodeCondition == v1.NodeDiskPressure && framework.TestContext.PrepullImages {
-				// The disk eviction test may cause the prepulled images to be evicted,
-				// prepull those images again to ensure this test not affect following tests.
-				PrePullAllImages()
-			}
-			By("making sure we can start a new pod after the test")
+
+			// In case a test fails before verifying that NodeCondition no longer exist on the node,
+			// we should wait for the NodeCondition to disappear
+			ginkgo.By(fmt.Sprintf("making sure NodeCondition %s no longer exists on the node", expectedNodeCondition))
+			gomega.Eventually(func() error {
+				if expectedNodeCondition != noPressure && hasNodeCondition(f, expectedNodeCondition) {
+					return fmt.Errorf("Conditions haven't returned to normal, node still has %s", expectedNodeCondition)
+				}
+				return nil
+			}, pressureDisappearTimeout, evictionPollInterval).Should(gomega.BeNil())
+
+			reduceAllocatableMemoryUsageIfCgroupv1()
+			ginkgo.By("making sure we have all the required images for testing")
+			prePullImagesIfNeccecary()
+
+			// Ensure that the NodeCondition hasn't returned after pulling images
+			ginkgo.By(fmt.Sprintf("making sure NodeCondition %s doesn't exist again after pulling images", expectedNodeCondition))
+			gomega.Eventually(func() error {
+				if expectedNodeCondition != noPressure && hasNodeCondition(f, expectedNodeCondition) {
+					return fmt.Errorf("Conditions haven't returned to normal, node still has %s", expectedNodeCondition)
+				}
+				return nil
+			}, pressureDisappearTimeout, evictionPollInterval).Should(gomega.BeNil())
+
+			ginkgo.By("making sure we can start a new pod after the test")
 			podName := "test-admit-pod"
 			f.PodClient().CreateSync(&v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -549,7 +633,7 @@ func runEvictionTest(f *framework.Framework, pressureTimeout time.Duration, expe
 				},
 			})
 
-			if CurrentGinkgoTestDescription().Failed {
+			if ginkgo.CurrentGinkgoTestDescription().Failed {
 				if framework.TestContext.DumpLogsOnFailure {
 					logPodEvents(f)
 					logNodeEvents(f)
@@ -563,17 +647,18 @@ func runEvictionTest(f *framework.Framework, pressureTimeout time.Duration, expe
 // This function panics (via Expect) if eviction ordering is violated, or if a priority-zero pod fails.
 func verifyEvictionOrdering(f *framework.Framework, testSpecs []podEvictSpec) error {
 	// Gather current information
-	updatedPodList, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).List(metav1.ListOptions{})
+	updatedPodList, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
 	updatedPods := updatedPodList.Items
 	for _, p := range updatedPods {
-		e2elog.Logf("fetching pod %s; phase= %v", p.Name, p.Status.Phase)
+		framework.Logf("fetching pod %s; phase= %v", p.Name, p.Status.Phase)
 	}
 
-	By("checking eviction ordering and ensuring important pods dont fail")
+	ginkgo.By("checking eviction ordering and ensuring important pods don't fail")
 	done := true
+	pendingPods := []string{}
 	for _, priorityPodSpec := range testSpecs {
 		var priorityPod v1.Pod
 		for _, p := range updatedPods {
@@ -581,8 +666,8 @@ func verifyEvictionOrdering(f *framework.Framework, testSpecs []podEvictSpec) er
 				priorityPod = p
 			}
 		}
-		Expect(priorityPod).NotTo(BeNil())
-		Expect(priorityPod.Status.Phase).NotTo(Equal(v1.PodSucceeded),
+		gomega.Expect(priorityPod).NotTo(gomega.BeNil())
+		framework.ExpectNotEqual(priorityPod.Status.Phase, v1.PodSucceeded,
 			fmt.Sprintf("pod: %s succeeded unexpectedly", priorityPod.Name))
 
 		// Check eviction ordering.
@@ -595,34 +680,35 @@ func verifyEvictionOrdering(f *framework.Framework, testSpecs []podEvictSpec) er
 					lowPriorityPod = p
 				}
 			}
-			Expect(lowPriorityPod).NotTo(BeNil())
+			gomega.Expect(lowPriorityPod).NotTo(gomega.BeNil())
 			if priorityPodSpec.evictionPriority < lowPriorityPodSpec.evictionPriority && lowPriorityPod.Status.Phase == v1.PodRunning {
-				Expect(priorityPod.Status.Phase).NotTo(Equal(v1.PodFailed),
+				framework.ExpectNotEqual(priorityPod.Status.Phase, v1.PodFailed,
 					fmt.Sprintf("priority %d pod: %s failed before priority %d pod: %s",
 						priorityPodSpec.evictionPriority, priorityPodSpec.pod.Name, lowPriorityPodSpec.evictionPriority, lowPriorityPodSpec.pod.Name))
 			}
 		}
 
 		if priorityPod.Status.Phase == v1.PodFailed {
-			Expect(priorityPod.Status.Reason, eviction.Reason, "pod %s failed; expected Status.Reason to be %s, but got %s",
+			framework.ExpectEqual(priorityPod.Status.Reason, eviction.Reason, "pod %s failed; expected Status.Reason to be %s, but got %s",
 				priorityPod.Name, eviction.Reason, priorityPod.Status.Reason)
 		}
 
 		// EvictionPriority 0 pods should not fail
 		if priorityPodSpec.evictionPriority == 0 {
-			Expect(priorityPod.Status.Phase).NotTo(Equal(v1.PodFailed),
+			framework.ExpectNotEqual(priorityPod.Status.Phase, v1.PodFailed,
 				fmt.Sprintf("priority 0 pod: %s failed", priorityPod.Name))
 		}
 
 		// If a pod that is not evictionPriority 0 has not been evicted, we are not done
 		if priorityPodSpec.evictionPriority != 0 && priorityPod.Status.Phase != v1.PodFailed {
+			pendingPods = append(pendingPods, priorityPod.ObjectMeta.Name)
 			done = false
 		}
 	}
 	if done {
 		return nil
 	}
-	return fmt.Errorf("pods that should be evicted are still running")
+	return fmt.Errorf("pods that should be evicted are still running: %#v", pendingPods)
 }
 
 func verifyEvictionEvents(f *framework.Framework, testSpecs []podEvictSpec, expectedStarvedResource v1.ResourceName) {
@@ -635,43 +721,43 @@ func verifyEvictionEvents(f *framework.Framework, testSpecs []podEvictSpec, expe
 				"involvedObject.namespace": f.Namespace.Name,
 				"reason":                   eviction.Reason,
 			}.AsSelector().String()
-			podEvictEvents, err := f.ClientSet.CoreV1().Events(f.Namespace.Name).List(metav1.ListOptions{FieldSelector: selector})
-			Expect(err).To(BeNil(), "Unexpected error getting events during eviction test: %v", err)
-			Expect(len(podEvictEvents.Items)).To(Equal(1), "Expected to find 1 eviction event for pod %s, got %d", pod.Name, len(podEvictEvents.Items))
+			podEvictEvents, err := f.ClientSet.CoreV1().Events(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{FieldSelector: selector})
+			gomega.Expect(err).To(gomega.BeNil(), "Unexpected error getting events during eviction test: %v", err)
+			framework.ExpectEqual(len(podEvictEvents.Items), 1, "Expected to find 1 eviction event for pod %s, got %d", pod.Name, len(podEvictEvents.Items))
 			event := podEvictEvents.Items[0]
 
 			if expectedStarvedResource != noStarvedResource {
 				// Check the eviction.StarvedResourceKey
 				starved, found := event.Annotations[eviction.StarvedResourceKey]
-				Expect(found).To(BeTrue(), "Expected to find an annotation on the eviction event for pod %s containing the starved resource %s, but it was not found",
+				framework.ExpectEqual(found, true, "Expected to find an annotation on the eviction event for pod %s containing the starved resource %s, but it was not found",
 					pod.Name, expectedStarvedResource)
 				starvedResource := v1.ResourceName(starved)
-				Expect(starvedResource).To(Equal(expectedStarvedResource), "Expected to the starved_resource annotation on pod %s to contain %s, but got %s instead",
+				framework.ExpectEqual(starvedResource, expectedStarvedResource, "Expected to the starved_resource annotation on pod %s to contain %s, but got %s instead",
 					pod.Name, expectedStarvedResource, starvedResource)
 
 				// We only check these keys for memory, because ephemeral storage evictions may be due to volume usage, in which case these values are not present
 				if expectedStarvedResource == v1.ResourceMemory {
 					// Check the eviction.OffendingContainersKey
 					offendersString, found := event.Annotations[eviction.OffendingContainersKey]
-					Expect(found).To(BeTrue(), "Expected to find an annotation on the eviction event for pod %s containing the offending containers, but it was not found",
+					framework.ExpectEqual(found, true, "Expected to find an annotation on the eviction event for pod %s containing the offending containers, but it was not found",
 						pod.Name)
 					offendingContainers := strings.Split(offendersString, ",")
-					Expect(len(offendingContainers)).To(Equal(1), "Expected to find the offending container's usage in the %s annotation, but no container was found",
+					framework.ExpectEqual(len(offendingContainers), 1, "Expected to find the offending container's usage in the %s annotation, but no container was found",
 						eviction.OffendingContainersKey)
-					Expect(offendingContainers[0]).To(Equal(pod.Spec.Containers[0].Name), "Expected to find the offending container: %s's usage in the %s annotation, but found %s instead",
+					framework.ExpectEqual(offendingContainers[0], pod.Spec.Containers[0].Name, "Expected to find the offending container: %s's usage in the %s annotation, but found %s instead",
 						pod.Spec.Containers[0].Name, eviction.OffendingContainersKey, offendingContainers[0])
 
 					// Check the eviction.OffendingContainersUsageKey
 					offendingUsageString, found := event.Annotations[eviction.OffendingContainersUsageKey]
-					Expect(found).To(BeTrue(), "Expected to find an annotation on the eviction event for pod %s containing the offending containers' usage, but it was not found",
+					framework.ExpectEqual(found, true, "Expected to find an annotation on the eviction event for pod %s containing the offending containers' usage, but it was not found",
 						pod.Name)
 					offendingContainersUsage := strings.Split(offendingUsageString, ",")
-					Expect(len(offendingContainersUsage)).To(Equal(1), "Expected to find the offending container's usage in the %s annotation, but found %+v",
+					framework.ExpectEqual(len(offendingContainersUsage), 1, "Expected to find the offending container's usage in the %s annotation, but found %+v",
 						eviction.OffendingContainersUsageKey, offendingContainersUsage)
 					usageQuantity, err := resource.ParseQuantity(offendingContainersUsage[0])
-					Expect(err).To(BeNil(), "Expected to be able to parse pod %s's %s annotation as a quantity, but got err: %v", pod.Name, eviction.OffendingContainersUsageKey, err)
+					gomega.Expect(err).To(gomega.BeNil(), "Expected to be able to parse pod %s's %s annotation as a quantity, but got err: %v", pod.Name, eviction.OffendingContainersUsageKey, err)
 					request := pod.Spec.Containers[0].Resources.Requests[starvedResource]
-					Expect(usageQuantity.Cmp(request)).To(Equal(1), "Expected usage of offending container: %s in pod %s to exceed its request %s",
+					framework.ExpectEqual(usageQuantity.Cmp(request), 1, "Expected usage of offending container: %s in pod %s to exceed its request %s",
 						usageQuantity.String(), pod.Name, request.String())
 				}
 			}
@@ -683,32 +769,32 @@ func verifyEvictionEvents(f *framework.Framework, testSpecs []podEvictSpec, expe
 func hasNodeCondition(f *framework.Framework, expectedNodeCondition v1.NodeConditionType) bool {
 	localNodeStatus := getLocalNode(f).Status
 	_, actualNodeCondition := testutils.GetNodeCondition(&localNodeStatus, expectedNodeCondition)
-	Expect(actualNodeCondition).NotTo(BeNil())
+	gomega.Expect(actualNodeCondition).NotTo(gomega.BeNil())
 	return actualNodeCondition.Status == v1.ConditionTrue
 }
 
 func logInodeMetrics() {
 	summary, err := getNodeSummary()
 	if err != nil {
-		e2elog.Logf("Error getting summary: %v", err)
+		framework.Logf("Error getting summary: %v", err)
 		return
 	}
 	if summary.Node.Runtime != nil && summary.Node.Runtime.ImageFs != nil && summary.Node.Runtime.ImageFs.Inodes != nil && summary.Node.Runtime.ImageFs.InodesFree != nil {
-		e2elog.Logf("imageFsInfo.Inodes: %d, imageFsInfo.InodesFree: %d", *summary.Node.Runtime.ImageFs.Inodes, *summary.Node.Runtime.ImageFs.InodesFree)
+		framework.Logf("imageFsInfo.Inodes: %d, imageFsInfo.InodesFree: %d", *summary.Node.Runtime.ImageFs.Inodes, *summary.Node.Runtime.ImageFs.InodesFree)
 	}
 	if summary.Node.Fs != nil && summary.Node.Fs.Inodes != nil && summary.Node.Fs.InodesFree != nil {
-		e2elog.Logf("rootFsInfo.Inodes: %d, rootFsInfo.InodesFree: %d", *summary.Node.Fs.Inodes, *summary.Node.Fs.InodesFree)
+		framework.Logf("rootFsInfo.Inodes: %d, rootFsInfo.InodesFree: %d", *summary.Node.Fs.Inodes, *summary.Node.Fs.InodesFree)
 	}
 	for _, pod := range summary.Pods {
-		e2elog.Logf("Pod: %s", pod.PodRef.Name)
+		framework.Logf("Pod: %s", pod.PodRef.Name)
 		for _, container := range pod.Containers {
 			if container.Rootfs != nil && container.Rootfs.InodesUsed != nil {
-				e2elog.Logf("--- summary Container: %s inodeUsage: %d", container.Name, *container.Rootfs.InodesUsed)
+				framework.Logf("--- summary Container: %s inodeUsage: %d", container.Name, *container.Rootfs.InodesUsed)
 			}
 		}
 		for _, volume := range pod.VolumeStats {
 			if volume.FsStats.InodesUsed != nil {
-				e2elog.Logf("--- summary Volume: %s inodeUsage: %d", volume.Name, *volume.FsStats.InodesUsed)
+				framework.Logf("--- summary Volume: %s inodeUsage: %d", volume.Name, *volume.FsStats.InodesUsed)
 			}
 		}
 	}
@@ -717,25 +803,25 @@ func logInodeMetrics() {
 func logDiskMetrics() {
 	summary, err := getNodeSummary()
 	if err != nil {
-		e2elog.Logf("Error getting summary: %v", err)
+		framework.Logf("Error getting summary: %v", err)
 		return
 	}
 	if summary.Node.Runtime != nil && summary.Node.Runtime.ImageFs != nil && summary.Node.Runtime.ImageFs.CapacityBytes != nil && summary.Node.Runtime.ImageFs.AvailableBytes != nil {
-		e2elog.Logf("imageFsInfo.CapacityBytes: %d, imageFsInfo.AvailableBytes: %d", *summary.Node.Runtime.ImageFs.CapacityBytes, *summary.Node.Runtime.ImageFs.AvailableBytes)
+		framework.Logf("imageFsInfo.CapacityBytes: %d, imageFsInfo.AvailableBytes: %d", *summary.Node.Runtime.ImageFs.CapacityBytes, *summary.Node.Runtime.ImageFs.AvailableBytes)
 	}
 	if summary.Node.Fs != nil && summary.Node.Fs.CapacityBytes != nil && summary.Node.Fs.AvailableBytes != nil {
-		e2elog.Logf("rootFsInfo.CapacityBytes: %d, rootFsInfo.AvailableBytes: %d", *summary.Node.Fs.CapacityBytes, *summary.Node.Fs.AvailableBytes)
+		framework.Logf("rootFsInfo.CapacityBytes: %d, rootFsInfo.AvailableBytes: %d", *summary.Node.Fs.CapacityBytes, *summary.Node.Fs.AvailableBytes)
 	}
 	for _, pod := range summary.Pods {
-		e2elog.Logf("Pod: %s", pod.PodRef.Name)
+		framework.Logf("Pod: %s", pod.PodRef.Name)
 		for _, container := range pod.Containers {
 			if container.Rootfs != nil && container.Rootfs.UsedBytes != nil {
-				e2elog.Logf("--- summary Container: %s UsedBytes: %d", container.Name, *container.Rootfs.UsedBytes)
+				framework.Logf("--- summary Container: %s UsedBytes: %d", container.Name, *container.Rootfs.UsedBytes)
 			}
 		}
 		for _, volume := range pod.VolumeStats {
 			if volume.FsStats.InodesUsed != nil {
-				e2elog.Logf("--- summary Volume: %s UsedBytes: %d", volume.Name, *volume.FsStats.UsedBytes)
+				framework.Logf("--- summary Volume: %s UsedBytes: %d", volume.Name, *volume.FsStats.UsedBytes)
 			}
 		}
 	}
@@ -744,22 +830,22 @@ func logDiskMetrics() {
 func logMemoryMetrics() {
 	summary, err := getNodeSummary()
 	if err != nil {
-		e2elog.Logf("Error getting summary: %v", err)
+		framework.Logf("Error getting summary: %v", err)
 		return
 	}
 	if summary.Node.Memory != nil && summary.Node.Memory.WorkingSetBytes != nil && summary.Node.Memory.AvailableBytes != nil {
-		e2elog.Logf("Node.Memory.WorkingSetBytes: %d, Node.Memory.AvailableBytes: %d", *summary.Node.Memory.WorkingSetBytes, *summary.Node.Memory.AvailableBytes)
+		framework.Logf("Node.Memory.WorkingSetBytes: %d, Node.Memory.AvailableBytes: %d", *summary.Node.Memory.WorkingSetBytes, *summary.Node.Memory.AvailableBytes)
 	}
 	for _, sysContainer := range summary.Node.SystemContainers {
-		if sysContainer.Name == stats.SystemContainerPods && sysContainer.Memory != nil && sysContainer.Memory.WorkingSetBytes != nil && sysContainer.Memory.AvailableBytes != nil {
-			e2elog.Logf("Allocatable.Memory.WorkingSetBytes: %d, Allocatable.Memory.AvailableBytes: %d", *sysContainer.Memory.WorkingSetBytes, *sysContainer.Memory.AvailableBytes)
+		if sysContainer.Name == kubeletstatsv1alpha1.SystemContainerPods && sysContainer.Memory != nil && sysContainer.Memory.WorkingSetBytes != nil && sysContainer.Memory.AvailableBytes != nil {
+			framework.Logf("Allocatable.Memory.WorkingSetBytes: %d, Allocatable.Memory.AvailableBytes: %d", *sysContainer.Memory.WorkingSetBytes, *sysContainer.Memory.AvailableBytes)
 		}
 	}
 	for _, pod := range summary.Pods {
-		e2elog.Logf("Pod: %s", pod.PodRef.Name)
+		framework.Logf("Pod: %s", pod.PodRef.Name)
 		for _, container := range pod.Containers {
 			if container.Memory != nil && container.Memory.WorkingSetBytes != nil {
-				e2elog.Logf("--- summary Container: %s WorkingSetBytes: %d", container.Name, *container.Memory.WorkingSetBytes)
+				framework.Logf("--- summary Container: %s WorkingSetBytes: %d", container.Name, *container.Memory.WorkingSetBytes)
 			}
 		}
 	}
@@ -768,16 +854,16 @@ func logMemoryMetrics() {
 func logPidMetrics() {
 	summary, err := getNodeSummary()
 	if err != nil {
-		e2elog.Logf("Error getting summary: %v", err)
+		framework.Logf("Error getting summary: %v", err)
 		return
 	}
 	if summary.Node.Rlimit != nil && summary.Node.Rlimit.MaxPID != nil && summary.Node.Rlimit.NumOfRunningProcesses != nil {
-		e2elog.Logf("Node.Rlimit.MaxPID: %d, Node.Rlimit.RunningProcesses: %d", *summary.Node.Rlimit.MaxPID, *summary.Node.Rlimit.NumOfRunningProcesses)
+		framework.Logf("Node.Rlimit.MaxPID: %d, Node.Rlimit.RunningProcesses: %d", *summary.Node.Rlimit.MaxPID, *summary.Node.Rlimit.NumOfRunningProcesses)
 	}
 }
 
-func eventuallyGetSummary() (s *stats.Summary) {
-	Eventually(func() error {
+func eventuallyGetSummary() (s *kubeletstatsv1alpha1.Summary) {
+	gomega.Eventually(func() error {
 		summary, err := getNodeSummary()
 		if err != nil {
 			return err
@@ -787,7 +873,7 @@ func eventuallyGetSummary() (s *stats.Summary) {
 		}
 		s = summary
 		return nil
-	}, time.Minute, evictionPollInterval).Should(BeNil())
+	}, time.Minute, evictionPollInterval).Should(gomega.BeNil())
 	return
 }
 

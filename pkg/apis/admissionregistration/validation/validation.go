@@ -27,7 +27,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/kubernetes/pkg/apis/admissionregistration"
-	"k8s.io/kubernetes/pkg/apis/admissionregistration/v1beta1"
+	admissionregistrationv1 "k8s.io/kubernetes/pkg/apis/admissionregistration/v1"
+	admissionregistrationv1beta1 "k8s.io/kubernetes/pkg/apis/admissionregistration/v1beta1"
 )
 
 func hasWildcard(slice []string) bool {
@@ -151,7 +152,11 @@ func validateRule(rule *admissionregistration.Rule, fldPath *field.Path, allowSu
 	return allErrors
 }
 
-var AcceptedAdmissionReviewVersions = []string{v1beta1.SchemeGroupVersion.Version}
+// AcceptedAdmissionReviewVersions contains the list of AdmissionReview versions the *prior* version of the API server understands.
+// 1.15: server understands v1beta1; accepted versions are ["v1beta1"]
+// 1.16: server understands v1, v1beta1; accepted versions are ["v1beta1"]
+// 1.17+: server understands v1, v1beta1; accepted versions are ["v1","v1beta1"]
+var AcceptedAdmissionReviewVersions = []string{admissionregistrationv1.SchemeGroupVersion.Version, admissionregistrationv1beta1.SchemeGroupVersion.Version}
 
 func isAcceptedAdmissionReviewVersion(v string) bool {
 	for _, version := range AcceptedAdmissionReviewVersions {
@@ -162,12 +167,12 @@ func isAcceptedAdmissionReviewVersion(v string) bool {
 	return false
 }
 
-func validateAdmissionReviewVersions(versions []string, requireRecognizedVersion bool, fldPath *field.Path) field.ErrorList {
+func validateAdmissionReviewVersions(versions []string, requireRecognizedAdmissionReviewVersion bool, fldPath *field.Path) field.ErrorList {
 	allErrors := field.ErrorList{}
 
 	// Currently only v1beta1 accepted in AdmissionReviewVersions
 	if len(versions) < 1 {
-		allErrors = append(allErrors, field.Required(fldPath, ""))
+		allErrors = append(allErrors, field.Required(fldPath, fmt.Sprintf("must specify one of %v", strings.Join(AcceptedAdmissionReviewVersions, ", "))))
 	} else {
 		seen := map[string]bool{}
 		hasAcceptedVersion := false
@@ -184,43 +189,73 @@ func validateAdmissionReviewVersions(versions []string, requireRecognizedVersion
 				hasAcceptedVersion = true
 			}
 		}
-		if requireRecognizedVersion && !hasAcceptedVersion {
+		if requireRecognizedAdmissionReviewVersion && !hasAcceptedVersion {
 			allErrors = append(allErrors, field.Invalid(
 				fldPath, versions,
-				fmt.Sprintf("none of the versions accepted by this server. accepted version(s) are %v",
+				fmt.Sprintf("must include at least one of %v",
 					strings.Join(AcceptedAdmissionReviewVersions, ", "))))
 		}
 	}
 	return allErrors
 }
 
+// ValidateValidatingWebhookConfiguration validates a webhook before creation.
 func ValidateValidatingWebhookConfiguration(e *admissionregistration.ValidatingWebhookConfiguration) field.ErrorList {
-	return validateValidatingWebhookConfiguration(e, true)
+	return validateValidatingWebhookConfiguration(e, validationOptions{
+		requireNoSideEffects:                    true,
+		requireRecognizedAdmissionReviewVersion: true,
+		requireUniqueWebhookNames:               true,
+	})
 }
 
-func validateValidatingWebhookConfiguration(e *admissionregistration.ValidatingWebhookConfiguration, requireRecognizedVersion bool) field.ErrorList {
+func validateValidatingWebhookConfiguration(e *admissionregistration.ValidatingWebhookConfiguration, opts validationOptions) field.ErrorList {
 	allErrors := genericvalidation.ValidateObjectMeta(&e.ObjectMeta, false, genericvalidation.NameIsDNSSubdomain, field.NewPath("metadata"))
+	hookNames := sets.NewString()
 	for i, hook := range e.Webhooks {
-		allErrors = append(allErrors, validateValidatingWebhook(&hook, field.NewPath("webhooks").Index(i))...)
-		allErrors = append(allErrors, validateAdmissionReviewVersions(hook.AdmissionReviewVersions, requireRecognizedVersion, field.NewPath("webhooks").Index(i).Child("admissionReviewVersions"))...)
+		allErrors = append(allErrors, validateValidatingWebhook(&hook, opts, field.NewPath("webhooks").Index(i))...)
+		allErrors = append(allErrors, validateAdmissionReviewVersions(hook.AdmissionReviewVersions, opts.requireRecognizedAdmissionReviewVersion, field.NewPath("webhooks").Index(i).Child("admissionReviewVersions"))...)
+		if opts.requireUniqueWebhookNames && len(hook.Name) > 0 {
+			if hookNames.Has(hook.Name) {
+				allErrors = append(allErrors, field.Duplicate(field.NewPath("webhooks").Index(i).Child("name"), hook.Name))
+			}
+			hookNames.Insert(hook.Name)
+		}
 	}
 	return allErrors
 }
 
+// ValidateMutatingWebhookConfiguration validates a webhook before creation.
 func ValidateMutatingWebhookConfiguration(e *admissionregistration.MutatingWebhookConfiguration) field.ErrorList {
-	return validateMutatingWebhookConfiguration(e, true)
+	return validateMutatingWebhookConfiguration(e, validationOptions{
+		requireNoSideEffects:                    true,
+		requireRecognizedAdmissionReviewVersion: true,
+		requireUniqueWebhookNames:               true,
+	})
 }
 
-func validateMutatingWebhookConfiguration(e *admissionregistration.MutatingWebhookConfiguration, requireRecognizedVersion bool) field.ErrorList {
+type validationOptions struct {
+	requireNoSideEffects                    bool
+	requireRecognizedAdmissionReviewVersion bool
+	requireUniqueWebhookNames               bool
+}
+
+func validateMutatingWebhookConfiguration(e *admissionregistration.MutatingWebhookConfiguration, opts validationOptions) field.ErrorList {
 	allErrors := genericvalidation.ValidateObjectMeta(&e.ObjectMeta, false, genericvalidation.NameIsDNSSubdomain, field.NewPath("metadata"))
+	hookNames := sets.NewString()
 	for i, hook := range e.Webhooks {
-		allErrors = append(allErrors, validateMutatingWebhook(&hook, field.NewPath("webhooks").Index(i))...)
-		allErrors = append(allErrors, validateAdmissionReviewVersions(hook.AdmissionReviewVersions, requireRecognizedVersion, field.NewPath("webhooks").Index(i).Child("admissionReviewVersions"))...)
+		allErrors = append(allErrors, validateMutatingWebhook(&hook, opts, field.NewPath("webhooks").Index(i))...)
+		allErrors = append(allErrors, validateAdmissionReviewVersions(hook.AdmissionReviewVersions, opts.requireRecognizedAdmissionReviewVersion, field.NewPath("webhooks").Index(i).Child("admissionReviewVersions"))...)
+		if opts.requireUniqueWebhookNames && len(hook.Name) > 0 {
+			if hookNames.Has(hook.Name) {
+				allErrors = append(allErrors, field.Duplicate(field.NewPath("webhooks").Index(i).Child("name"), hook.Name))
+			}
+			hookNames.Insert(hook.Name)
+		}
 	}
 	return allErrors
 }
 
-func validateValidatingWebhook(hook *admissionregistration.ValidatingWebhook, fldPath *field.Path) field.ErrorList {
+func validateValidatingWebhook(hook *admissionregistration.ValidatingWebhook, opts validationOptions, fldPath *field.Path) field.ErrorList {
 	var allErrors field.ErrorList
 	// hook.Name must be fully qualified
 	allErrors = append(allErrors, utilvalidation.IsFullyQualifiedName(fldPath.Child("name"), hook.Name)...)
@@ -234,8 +269,15 @@ func validateValidatingWebhook(hook *admissionregistration.ValidatingWebhook, fl
 	if hook.MatchPolicy != nil && !supportedMatchPolicies.Has(string(*hook.MatchPolicy)) {
 		allErrors = append(allErrors, field.NotSupported(fldPath.Child("matchPolicy"), *hook.MatchPolicy, supportedMatchPolicies.List()))
 	}
-	if hook.SideEffects != nil && !supportedSideEffectClasses.Has(string(*hook.SideEffects)) {
-		allErrors = append(allErrors, field.NotSupported(fldPath.Child("sideEffects"), *hook.SideEffects, supportedSideEffectClasses.List()))
+	allowedSideEffects := supportedSideEffectClasses
+	if opts.requireNoSideEffects {
+		allowedSideEffects = noSideEffectClasses
+	}
+	if hook.SideEffects == nil {
+		allErrors = append(allErrors, field.Required(fldPath.Child("sideEffects"), fmt.Sprintf("must specify one of %v", strings.Join(allowedSideEffects.List(), ", "))))
+	}
+	if hook.SideEffects != nil && !allowedSideEffects.Has(string(*hook.SideEffects)) {
+		allErrors = append(allErrors, field.NotSupported(fldPath.Child("sideEffects"), *hook.SideEffects, allowedSideEffects.List()))
 	}
 	if hook.TimeoutSeconds != nil && (*hook.TimeoutSeconds > 30 || *hook.TimeoutSeconds < 1) {
 		allErrors = append(allErrors, field.Invalid(fldPath.Child("timeoutSeconds"), *hook.TimeoutSeconds, "the timeout value must be between 1 and 30 seconds"))
@@ -261,7 +303,7 @@ func validateValidatingWebhook(hook *admissionregistration.ValidatingWebhook, fl
 	return allErrors
 }
 
-func validateMutatingWebhook(hook *admissionregistration.MutatingWebhook, fldPath *field.Path) field.ErrorList {
+func validateMutatingWebhook(hook *admissionregistration.MutatingWebhook, opts validationOptions, fldPath *field.Path) field.ErrorList {
 	var allErrors field.ErrorList
 	// hook.Name must be fully qualified
 	allErrors = append(allErrors, utilvalidation.IsFullyQualifiedName(fldPath.Child("name"), hook.Name)...)
@@ -275,8 +317,15 @@ func validateMutatingWebhook(hook *admissionregistration.MutatingWebhook, fldPat
 	if hook.MatchPolicy != nil && !supportedMatchPolicies.Has(string(*hook.MatchPolicy)) {
 		allErrors = append(allErrors, field.NotSupported(fldPath.Child("matchPolicy"), *hook.MatchPolicy, supportedMatchPolicies.List()))
 	}
-	if hook.SideEffects != nil && !supportedSideEffectClasses.Has(string(*hook.SideEffects)) {
-		allErrors = append(allErrors, field.NotSupported(fldPath.Child("sideEffects"), *hook.SideEffects, supportedSideEffectClasses.List()))
+	allowedSideEffects := supportedSideEffectClasses
+	if opts.requireNoSideEffects {
+		allowedSideEffects = noSideEffectClasses
+	}
+	if hook.SideEffects == nil {
+		allErrors = append(allErrors, field.Required(fldPath.Child("sideEffects"), fmt.Sprintf("must specify one of %v", strings.Join(allowedSideEffects.List(), ", "))))
+	}
+	if hook.SideEffects != nil && !allowedSideEffects.Has(string(*hook.SideEffects)) {
+		allErrors = append(allErrors, field.NotSupported(fldPath.Child("sideEffects"), *hook.SideEffects, allowedSideEffects.List()))
 	}
 	if hook.TimeoutSeconds != nil && (*hook.TimeoutSeconds > 30 || *hook.TimeoutSeconds < 1) {
 		allErrors = append(allErrors, field.Invalid(fldPath.Child("timeoutSeconds"), *hook.TimeoutSeconds, "the timeout value must be between 1 and 30 seconds"))
@@ -318,6 +367,11 @@ var supportedSideEffectClasses = sets.NewString(
 	string(admissionregistration.SideEffectClassUnknown),
 	string(admissionregistration.SideEffectClassNone),
 	string(admissionregistration.SideEffectClassSome),
+	string(admissionregistration.SideEffectClassNoneOnDryRun),
+)
+
+var noSideEffectClasses = sets.NewString(
+	string(admissionregistration.SideEffectClassNone),
 	string(admissionregistration.SideEffectClassNoneOnDryRun),
 )
 
@@ -397,10 +451,64 @@ func validatingHasAcceptedAdmissionReviewVersions(webhooks []admissionregistrati
 	return true
 }
 
-func ValidateValidatingWebhookConfigurationUpdate(newC, oldC *admissionregistration.ValidatingWebhookConfiguration) field.ErrorList {
-	return validateValidatingWebhookConfiguration(newC, validatingHasAcceptedAdmissionReviewVersions(oldC.Webhooks))
+// mutatingHasUniqueWebhookNames returns true if all webhooks have unique names
+func mutatingHasUniqueWebhookNames(webhooks []admissionregistration.MutatingWebhook) bool {
+	names := sets.NewString()
+	for _, hook := range webhooks {
+		if names.Has(hook.Name) {
+			return false
+		}
+		names.Insert(hook.Name)
+	}
+	return true
 }
 
+// validatingHasUniqueWebhookNames returns true if all webhooks have unique names
+func validatingHasUniqueWebhookNames(webhooks []admissionregistration.ValidatingWebhook) bool {
+	names := sets.NewString()
+	for _, hook := range webhooks {
+		if names.Has(hook.Name) {
+			return false
+		}
+		names.Insert(hook.Name)
+	}
+	return true
+}
+
+// mutatingHasNoSideEffects returns true if all webhooks have no side effects
+func mutatingHasNoSideEffects(webhooks []admissionregistration.MutatingWebhook) bool {
+	for _, hook := range webhooks {
+		if hook.SideEffects == nil || !noSideEffectClasses.Has(string(*hook.SideEffects)) {
+			return false
+		}
+	}
+	return true
+}
+
+// validatingHasNoSideEffects returns true if all webhooks have no side effects
+func validatingHasNoSideEffects(webhooks []admissionregistration.ValidatingWebhook) bool {
+	for _, hook := range webhooks {
+		if hook.SideEffects == nil || !noSideEffectClasses.Has(string(*hook.SideEffects)) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateValidatingWebhookConfigurationUpdate validates update of validating webhook configuration
+func ValidateValidatingWebhookConfigurationUpdate(newC, oldC *admissionregistration.ValidatingWebhookConfiguration) field.ErrorList {
+	return validateValidatingWebhookConfiguration(newC, validationOptions{
+		requireNoSideEffects:                    validatingHasNoSideEffects(oldC.Webhooks),
+		requireRecognizedAdmissionReviewVersion: validatingHasAcceptedAdmissionReviewVersions(oldC.Webhooks),
+		requireUniqueWebhookNames:               validatingHasUniqueWebhookNames(oldC.Webhooks),
+	})
+}
+
+// ValidateMutatingWebhookConfigurationUpdate validates update of mutating webhook configuration
 func ValidateMutatingWebhookConfigurationUpdate(newC, oldC *admissionregistration.MutatingWebhookConfiguration) field.ErrorList {
-	return validateMutatingWebhookConfiguration(newC, mutatingHasAcceptedAdmissionReviewVersions(oldC.Webhooks))
+	return validateMutatingWebhookConfiguration(newC, validationOptions{
+		requireNoSideEffects:                    mutatingHasNoSideEffects(oldC.Webhooks),
+		requireRecognizedAdmissionReviewVersion: mutatingHasAcceptedAdmissionReviewVersions(oldC.Webhooks),
+		requireUniqueWebhookNames:               mutatingHasUniqueWebhookNames(oldC.Webhooks),
+	})
 }

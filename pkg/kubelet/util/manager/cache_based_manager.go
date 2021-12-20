@@ -23,14 +23,14 @@ import (
 	"time"
 
 	"k8s.io/api/core/v1"
-	storageetcd "k8s.io/apiserver/pkg/storage/etcd"
+	storageetcd3 "k8s.io/apiserver/pkg/storage/etcd3"
 	"k8s.io/kubernetes/pkg/kubelet/util"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/clock"
 )
 
 // GetObjectTTLFunc defines a function to get value of TTL.
@@ -85,8 +85,8 @@ func isObjectOlder(newObject, oldObject runtime.Object) bool {
 	if newObject == nil || oldObject == nil {
 		return false
 	}
-	newVersion, _ := storageetcd.Versioner.ObjectResourceVersion(newObject)
-	oldVersion, _ := storageetcd.Versioner.ObjectResourceVersion(oldObject)
+	newVersion, _ := storageetcd3.Versioner.ObjectResourceVersion(newObject)
+	oldVersion, _ := storageetcd3.Versioner.ObjectResourceVersion(oldObject)
 	return newVersion < oldVersion
 }
 

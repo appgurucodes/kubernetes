@@ -24,42 +24,67 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"k8s.io/klog"
+
+	versionutil "k8s.io/apimachinery/pkg/util/version"
+	componentversion "k8s.io/component-base/version"
+	"k8s.io/klog/v2"
+	utilsexec "k8s.io/utils/exec"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/images"
+	preflight "k8s.io/kubernetes/cmd/kubeadm/app/preflight"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
-	nodeutil "k8s.io/kubernetes/pkg/util/node"
-	"k8s.io/kubernetes/pkg/util/procfs"
-	utilsexec "k8s.io/utils/exec"
 )
 
 type kubeletFlagsOpts struct {
 	nodeRegOpts              *kubeadmapi.NodeRegistrationOptions
-	featureGates             map[string]bool
 	pauseImage               string
 	registerTaintsUsingFlags bool
-	execer                   utilsexec.Interface
-	pidOfFunc                func(string) ([]int, error)
-	defaultHostname          string
+	// This is a temporary measure until kubeadm no longer supports a kubelet version with built-in dockershim.
+	// TODO: https://github.com/kubernetes/kubeadm/issues/2626
+	kubeletVersion *versionutil.Version
+}
+
+// GetNodeNameAndHostname obtains the name for this Node using the following precedence
+// (from lower to higher):
+// - actual hostname
+// - NodeRegistrationOptions.Name (same as "--node-name" passed to "kubeadm init/join")
+// - "hostname-overide" flag in NodeRegistrationOptions.KubeletExtraArgs
+// It also returns the hostname or an error if getting the hostname failed.
+func GetNodeNameAndHostname(cfg *kubeadmapi.NodeRegistrationOptions) (string, string, error) {
+	hostname, err := kubeadmutil.GetHostname("")
+	nodeName := hostname
+	if cfg.Name != "" {
+		nodeName = cfg.Name
+	}
+	if name, ok := cfg.KubeletExtraArgs["hostname-override"]; ok {
+		nodeName = name
+	}
+	return nodeName, hostname, err
 }
 
 // WriteKubeletDynamicEnvFile writes an environment file with dynamic flags to the kubelet.
 // Used at "kubeadm init" and "kubeadm join" time.
 func WriteKubeletDynamicEnvFile(cfg *kubeadmapi.ClusterConfiguration, nodeReg *kubeadmapi.NodeRegistrationOptions, registerTaintsUsingFlags bool, kubeletDir string) error {
-	hostName, err := nodeutil.GetHostname("")
+	// This is a temporary measure until kubeadm no longer supports a kubelet version with built-in dockershim.
+	// TODO: https://github.com/kubernetes/kubeadm/issues/2626
+	kubeletVersion, err := preflight.GetKubeletVersion(utilsexec.New())
 	if err != nil {
-		return err
+		// We cannot return an error here, due to the k/k CI, where /cmd/kubeadm/test tests run without
+		// a kubelet built on the host. On error, we assume a kubelet version equal to the version
+		// of the kubeadm binary. During normal cluster creation this should not happens as kubeadm needs
+		// the kubelet binary for init / join.
+		kubeletVersion = versionutil.MustParseSemantic(componentversion.Get().GitVersion)
+		klog.Warningf("cannot obtain the version of the kubelet while writing dynamic environment file: %v."+
+			" Using the version of the kubeadm binary: %s", err, kubeletVersion.String())
 	}
 
 	flagOpts := kubeletFlagsOpts{
 		nodeRegOpts:              nodeReg,
-		featureGates:             cfg.FeatureGates,
 		pauseImage:               images.GetPauseImage(cfg),
 		registerTaintsUsingFlags: registerTaintsUsingFlags,
-		execer:                   utilsexec.New(),
-		pidOfFunc:                procfs.PidOf,
-		defaultHostname:          hostName,
+		kubeletVersion:           kubeletVersion,
 	}
 	stringMap := buildKubeletArgMap(flagOpts)
 	argList := kubeadmutil.BuildArgumentListFromMap(stringMap, nodeReg.KubeletExtraArgs)
@@ -68,26 +93,26 @@ func WriteKubeletDynamicEnvFile(cfg *kubeadmapi.ClusterConfiguration, nodeReg *k
 	return writeKubeletFlagBytesToDisk([]byte(envFileContent), kubeletDir)
 }
 
-// buildKubeletArgMap takes a kubeletFlagsOpts object and builds based on that a string-string map with flags
-// that should be given to the local kubelet daemon.
-func buildKubeletArgMap(opts kubeletFlagsOpts) map[string]string {
+//buildKubeletArgMapCommon takes a kubeletFlagsOpts object and builds based on that a string-string map with flags
+//that are common to both Linux and Windows
+func buildKubeletArgMapCommon(opts kubeletFlagsOpts) map[string]string {
 	kubeletFlags := map[string]string{}
 
-	if opts.nodeRegOpts.CRISocket == constants.DefaultDockerCRISocket {
-		// These flags should only be set when running docker
+	// This is a temporary measure until kubeadm no longer supports a kubelet version with built-in dockershim.
+	// Once that happens only the "remote" branch option should be left.
+	// TODO: https://github.com/kubernetes/kubeadm/issues/2626
+	hasDockershim := opts.kubeletVersion.Major() == 1 && opts.kubeletVersion.Minor() < 24
+	if opts.nodeRegOpts.CRISocket == constants.DefaultDockerCRISocket && hasDockershim {
 		kubeletFlags["network-plugin"] = "cni"
-		driver, err := kubeadmutil.GetCgroupDriverDocker(opts.execer)
-		if err != nil {
-			klog.Warningf("cannot automatically assign a '--cgroup-driver' value when starting the Kubelet: %v\n", err)
-		} else {
-			kubeletFlags["cgroup-driver"] = driver
-		}
-		if opts.pauseImage != "" {
-			kubeletFlags["pod-infra-container-image"] = opts.pauseImage
-		}
 	} else {
 		kubeletFlags["container-runtime"] = "remote"
 		kubeletFlags["container-runtime-endpoint"] = opts.nodeRegOpts.CRISocket
+	}
+
+	// This flag passes the pod infra container image (e.g. "pause" image) to the kubelet
+	// and prevents its garbage collection
+	if opts.pauseImage != "" {
+		kubeletFlags["pod-infra-container-image"] = opts.pauseImage
 	}
 
 	if opts.registerTaintsUsingFlags && opts.nodeRegOpts.Taints != nil && len(opts.nodeRegOpts.Taints) > 0 {
@@ -99,18 +124,15 @@ func buildKubeletArgMap(opts kubeletFlagsOpts) map[string]string {
 		kubeletFlags["register-with-taints"] = strings.Join(taintStrs, ",")
 	}
 
-	if pids, _ := opts.pidOfFunc("systemd-resolved"); len(pids) > 0 {
-		// procfs.PidOf only returns an error if the regex is empty or doesn't compile, so we can ignore it
-		kubeletFlags["resolv-conf"] = "/run/systemd/resolve/resolv.conf"
+	// Pass the "--hostname-override" flag to the kubelet only if it's different from the hostname
+	nodeName, hostname, err := GetNodeNameAndHostname(opts.nodeRegOpts)
+	if err != nil {
+		klog.Warning(err)
 	}
-
-	// Make sure the node name we're passed will work with Kubelet
-	if opts.nodeRegOpts.Name != "" && opts.nodeRegOpts.Name != opts.defaultHostname {
-		klog.V(1).Infof("setting kubelet hostname-override to %q", opts.nodeRegOpts.Name)
-		kubeletFlags["hostname-override"] = opts.nodeRegOpts.Name
+	if nodeName != hostname {
+		klog.V(1).Infof("setting kubelet hostname-override to %q", nodeName)
+		kubeletFlags["hostname-override"] = nodeName
 	}
-
-	// TODO: Conditionally set `--cgroup-driver` to either `systemd` or `cgroupfs` for CRI other than Docker
 
 	return kubeletFlags
 }
@@ -128,4 +150,10 @@ func writeKubeletFlagBytesToDisk(b []byte, kubeletDir string) error {
 		return errors.Wrapf(err, "failed to write kubelet configuration to the file %q", kubeletEnvFilePath)
 	}
 	return nil
+}
+
+// buildKubeletArgMap takes a kubeletFlagsOpts object and builds based on that a string-string map with flags
+// that should be given to the local kubelet daemon.
+func buildKubeletArgMap(opts kubeletFlagsOpts) map[string]string {
+	return buildKubeletArgMapCommon(opts)
 }

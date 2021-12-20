@@ -48,10 +48,10 @@ BASH_TARGETS="
 	update-codegen
 	update-generated-runtime
 	update-generated-device-plugin
+	update-generated-api-compatibility-data
 	update-generated-docs
 	update-generated-swagger-docs
 	update-openapi-spec
-	update-bazel
 	update-gofmt"
 
 for t in ${BASH_TARGETS}; do

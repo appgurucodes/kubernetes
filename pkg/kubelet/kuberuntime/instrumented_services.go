@@ -20,7 +20,7 @@ import (
 	"time"
 
 	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 )
 
@@ -49,16 +49,13 @@ func newInstrumentedImageManagerService(service internalapi.ImageManagerService)
 // recordOperation records the duration of the operation.
 func recordOperation(operation string, start time.Time) {
 	metrics.RuntimeOperations.WithLabelValues(operation).Inc()
-	metrics.DeprecatedRuntimeOperations.WithLabelValues(operation).Inc()
 	metrics.RuntimeOperationsDuration.WithLabelValues(operation).Observe(metrics.SinceInSeconds(start))
-	metrics.DeprecatedRuntimeOperationsLatency.WithLabelValues(operation).Observe(metrics.SinceInMicroseconds(start))
 }
 
 // recordError records error for metric if an error occurred.
 func recordError(operation string, err error) {
 	if err != nil {
 		metrics.RuntimeOperationsErrors.WithLabelValues(operation).Inc()
-		metrics.DeprecatedRuntimeOperationsErrors.WithLabelValues(operation).Inc()
 	}
 }
 
@@ -243,6 +240,24 @@ func (in instrumentedRuntimeService) ListContainerStats(filter *runtimeapi.Conta
 	defer recordOperation(operation, time.Now())
 
 	out, err := in.service.ListContainerStats(filter)
+	recordError(operation, err)
+	return out, err
+}
+
+func (in instrumentedRuntimeService) PodSandboxStats(podSandboxID string) (*runtimeapi.PodSandboxStats, error) {
+	const operation = "podsandbox_stats"
+	defer recordOperation(operation, time.Now())
+
+	out, err := in.service.PodSandboxStats(podSandboxID)
+	recordError(operation, err)
+	return out, err
+}
+
+func (in instrumentedRuntimeService) ListPodSandboxStats(filter *runtimeapi.PodSandboxStatsFilter) ([]*runtimeapi.PodSandboxStats, error) {
+	const operation = "list_podsandbox_stats"
+	defer recordOperation(operation, time.Now())
+
+	out, err := in.service.ListPodSandboxStats(filter)
 	recordError(operation, err)
 	return out, err
 }

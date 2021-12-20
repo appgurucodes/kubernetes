@@ -17,8 +17,10 @@ limitations under the License.
 package events
 
 import (
-	"k8s.io/api/events/v1beta1"
+	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
 )
 
 // EventRecorder knows how to record events on behalf of an EventSource.
@@ -33,6 +35,9 @@ type EventRecorder interface {
 	// should be in UpperCamelCase format (starting with a capital letter). "reason" will be used
 	// to automate handling of events, so imagine people writing switch statements to handle them.
 	// You want to make that easy.
+	// 'action' explains what happened with regarding/what action did the ReportingController
+	// (ReportingController is a type of a Controller reporting an Event, e.g. k8s.io/node-controller, k8s.io/kubelet.)
+	// take in regarding's name; it should be in UpperCamelCase format (starting with a capital letter).
 	// 'note' is intended to be human readable.
 	Eventf(regarding runtime.Object, related runtime.Object, eventtype, reason, action, note string, args ...interface{})
 }
@@ -45,6 +50,19 @@ type EventBroadcaster interface {
 	// NewRecorder returns an EventRecorder that can be used to send events to this EventBroadcaster
 	// with the event source set to the given event source.
 	NewRecorder(scheme *runtime.Scheme, reportingController string) EventRecorder
+
+	// StartEventWatcher enables you to watch for emitted events without usage
+	// of StartRecordingToSink. This lets you also process events in a custom way (e.g. in tests).
+	// NOTE: events received on your eventHandler should be copied before being used.
+	// TODO: figure out if this can be removed.
+	StartEventWatcher(eventHandler func(event runtime.Object)) func()
+
+	// StartStructuredLogging starts sending events received from this EventBroadcaster to the structured
+	// logging function. The return value can be ignored or used to stop recording, if desired.
+	StartStructuredLogging(verbosity klog.Level) func()
+
+	// Shutdown shuts down the broadcaster
+	Shutdown()
 }
 
 // EventSink knows how to store events (client-go implements it.)
@@ -52,7 +70,26 @@ type EventBroadcaster interface {
 // It is assumed that EventSink will return the same sorts of errors as
 // client-go's REST client.
 type EventSink interface {
-	Create(event *v1beta1.Event) (*v1beta1.Event, error)
-	Update(event *v1beta1.Event) (*v1beta1.Event, error)
-	Patch(oldEvent *v1beta1.Event, data []byte) (*v1beta1.Event, error)
+	Create(event *eventsv1.Event) (*eventsv1.Event, error)
+	Update(event *eventsv1.Event) (*eventsv1.Event, error)
+	Patch(oldEvent *eventsv1.Event, data []byte) (*eventsv1.Event, error)
+}
+
+// EventBroadcasterAdapter is a auxiliary interface to simplify migration to
+// the new events API. It is a wrapper around new and legacy broadcasters
+// that smartly chooses which one to use.
+//
+// Deprecated: This interface will be removed once migration is completed.
+type EventBroadcasterAdapter interface {
+	// StartRecordingToSink starts sending events received from the specified eventBroadcaster.
+	StartRecordingToSink(stopCh <-chan struct{})
+
+	// NewRecorder creates a new Event Recorder with specified name.
+	NewRecorder(name string) EventRecorder
+
+	// DeprecatedNewLegacyRecorder creates a legacy Event Recorder with specific name.
+	DeprecatedNewLegacyRecorder(name string) record.EventRecorder
+
+	// Shutdown shuts down the broadcaster.
+	Shutdown()
 }

@@ -24,17 +24,17 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/cache"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/metrics"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/statusupdater"
 	kevents "k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/util/goroutinemap/exponentialbackoff"
-	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/operationexecutor"
 )
 
@@ -134,42 +134,6 @@ func (rc *reconciler) syncStates() {
 	rc.attacherDetacher.VerifyVolumesAreAttached(volumesPerNode, rc.actualStateOfWorld)
 }
 
-// isMultiAttachForbidden checks if attaching this volume to multiple nodes is definitely not allowed/possible.
-// In its current form, this function can only reliably say for which volumes it's definitely forbidden. If it returns
-// false, it is not guaranteed that multi-attach is actually supported by the volume type and we must rely on the
-// attacher to fail fast in such cases.
-// Please see https://github.com/kubernetes/kubernetes/issues/40669 and https://github.com/kubernetes/kubernetes/pull/40148#discussion_r98055047
-func (rc *reconciler) isMultiAttachForbidden(volumeSpec *volume.Spec) bool {
-	if volumeSpec.Volume != nil {
-		// Check for volume types which are known to fail slow or cause trouble when trying to multi-attach
-		if volumeSpec.Volume.AzureDisk != nil ||
-			volumeSpec.Volume.Cinder != nil {
-			return true
-		}
-	}
-
-	// Only if this volume is a persistent volume, we have reliable information on whether it's allowed or not to
-	// multi-attach. We trust in the individual volume implementations to not allow unsupported access modes
-	if volumeSpec.PersistentVolume != nil {
-		// Check for persistent volume types which do not fail when trying to multi-attach
-		if len(volumeSpec.PersistentVolume.Spec.AccessModes) == 0 {
-			// No access mode specified so we don't know for sure. Let the attacher fail if needed
-			return false
-		}
-
-		// check if this volume is allowed to be attached to multiple PODs/nodes, if yes, return false
-		for _, accessMode := range volumeSpec.PersistentVolume.Spec.AccessModes {
-			if accessMode == v1.ReadWriteMany || accessMode == v1.ReadOnlyMany {
-				return false
-			}
-		}
-		return true
-	}
-
-	// we don't know if it's supported or not and let the attacher fail later in cases it's not supported
-	return false
-}
-
 func (rc *reconciler) reconcile() {
 	// Detaches are triggered before attaches so that volumes referenced by
 	// pods that are rescheduled to a different node are detached first.
@@ -178,12 +142,38 @@ func (rc *reconciler) reconcile() {
 	for _, attachedVolume := range rc.actualStateOfWorld.GetAttachedVolumes() {
 		if !rc.desiredStateOfWorld.VolumeExists(
 			attachedVolume.VolumeName, attachedVolume.NodeName) {
-			// Don't even try to start an operation if there is already one running
+
+			// Check whether there already exist an operation pending, and don't even
+			// try to start an operation if there is already one running.
 			// This check must be done before we do any other checks, as otherwise the other checks
 			// may pass while at the same time the volume leaves the pending state, resulting in
 			// double detach attempts
-			if rc.attacherDetacher.IsOperationPending(attachedVolume.VolumeName, "") {
-				klog.V(10).Infof("Operation for volume %q is already running. Can't start detach for %q", attachedVolume.VolumeName, attachedVolume.NodeName)
+			// The operation key format is different depending on whether the volume
+			// allows multi attach across different nodes.
+			if util.IsMultiAttachAllowed(attachedVolume.VolumeSpec) {
+				if !rc.attacherDetacher.IsOperationSafeToRetry(attachedVolume.VolumeName, "" /* podName */, attachedVolume.NodeName, operationexecutor.DetachOperationName) {
+					klog.V(10).Infof("Operation for volume %q is already running or still in exponential backoff for node %q. Can't start detach", attachedVolume.VolumeName, attachedVolume.NodeName)
+					continue
+				}
+			} else {
+				if !rc.attacherDetacher.IsOperationSafeToRetry(attachedVolume.VolumeName, "" /* podName */, "" /* nodeName */, operationexecutor.DetachOperationName) {
+					klog.V(10).Infof("Operation for volume %q is already running or still in exponential backoff in the cluster. Can't start detach for %q", attachedVolume.VolumeName, attachedVolume.NodeName)
+					continue
+				}
+			}
+
+			// Because the detach operation updates the ActualStateOfWorld before
+			// marking itself complete, it's possible for the volume to be removed
+			// from the ActualStateOfWorld between the GetAttachedVolumes() check
+			// and the IsOperationPending() check above.
+			// Check the ActualStateOfWorld again to avoid issuing an unnecessary
+			// detach.
+			// See https://github.com/kubernetes/kubernetes/issues/93902
+			attachState := rc.actualStateOfWorld.GetAttachState(attachedVolume.VolumeName, attachedVolume.NodeName)
+			if attachState == cache.AttachStateDetached {
+				if klog.V(5).Enabled() {
+					klog.Infof(attachedVolume.GenerateMsgDetailed("Volume detached--skipping", ""))
+				}
 				continue
 			}
 
@@ -203,6 +193,8 @@ func (rc *reconciler) reconcile() {
 
 			// Before triggering volume detach, mark volume as detached and update the node status
 			// If it fails to update node status, skip detach volume
+			// If volume detach operation fails, the volume needs to be added back to report as attached so that node status
+			// has the correct volume attachment information.
 			err = rc.actualStateOfWorld.RemoveVolumeFromReportAsAttached(attachedVolume.VolumeName, attachedVolume.NodeName)
 			if err != nil {
 				klog.V(5).Infof("RemoveVolumeFromReportAsAttached failed while removing volume %q from node %q with: %v",
@@ -219,7 +211,7 @@ func (rc *reconciler) reconcile() {
 				continue
 			}
 
-			// Trigger detach volume which requires verifing safe to detach step
+			// Trigger detach volume which requires verifying safe to detach step
 			// If timeout is true, skip verifySafeToDetach check
 			klog.V(5).Infof(attachedVolume.GenerateMsgDetailed("Starting attacherDetacher.DetachVolume", ""))
 			verifySafeToDetach := !timeout
@@ -232,10 +224,17 @@ func (rc *reconciler) reconcile() {
 					klog.Warningf(attachedVolume.GenerateMsgDetailed("attacherDetacher.DetachVolume started", fmt.Sprintf("This volume is not safe to detach, but maxWaitForUnmountDuration %v expired, force detaching", rc.maxWaitForUnmountDuration)))
 				}
 			}
-			if err != nil && !exponentialbackoff.IsExponentialBackoff(err) {
-				// Ignore exponentialbackoff.IsExponentialBackoff errors, they are expected.
-				// Log all other errors.
-				klog.Errorf(attachedVolume.GenerateErrorDetailed("attacherDetacher.DetachVolume failed to start", err).Error())
+			if err != nil {
+				// Add volume back to ReportAsAttached if DetachVolume call failed so that node status updater will add it back to VolumeAttached list.
+				// This function is also called during executing the volume detach operation in operation_generoator.
+				// It is needed here too because DetachVolume call might fail before executing the actual operation in operation_executor (e.g., cannot find volume plugin etc.)
+				rc.actualStateOfWorld.AddVolumeToReportAsAttached(attachedVolume.VolumeName, attachedVolume.NodeName)
+
+				if !exponentialbackoff.IsExponentialBackoff(err) {
+					// Ignore exponentialbackoff.IsExponentialBackoff errors, they are expected.
+					// Log all other errors.
+					klog.Errorf(attachedVolume.GenerateErrorDetailed("attacherDetacher.DetachVolume failed to start", err).Error())
+				}
 			}
 		}
 	}
@@ -252,23 +251,40 @@ func (rc *reconciler) reconcile() {
 func (rc *reconciler) attachDesiredVolumes() {
 	// Ensure volumes that should be attached are attached.
 	for _, volumeToAttach := range rc.desiredStateOfWorld.GetVolumesToAttach() {
-		if rc.actualStateOfWorld.IsVolumeAttachedToNode(volumeToAttach.VolumeName, volumeToAttach.NodeName) {
+		if util.IsMultiAttachAllowed(volumeToAttach.VolumeSpec) {
+			// Don't even try to start an operation if there is already one running for the given volume and node.
+			if rc.attacherDetacher.IsOperationPending(volumeToAttach.VolumeName, "" /* podName */, volumeToAttach.NodeName) {
+				if klog.V(10).Enabled() {
+					klog.Infof("Operation for volume %q is already running for node %q. Can't start attach", volumeToAttach.VolumeName, volumeToAttach.NodeName)
+				}
+				continue
+			}
+		} else {
+			// Don't even try to start an operation if there is already one running for the given volume
+			if rc.attacherDetacher.IsOperationPending(volumeToAttach.VolumeName, "" /* podName */, "" /* nodeName */) {
+				if klog.V(10).Enabled() {
+					klog.Infof("Operation for volume %q is already running. Can't start attach for %q", volumeToAttach.VolumeName, volumeToAttach.NodeName)
+				}
+				continue
+			}
+		}
+
+		// Because the attach operation updates the ActualStateOfWorld before
+		// marking itself complete, IsOperationPending() must be checked before
+		// GetAttachState() to guarantee the ActualStateOfWorld is
+		// up-to-date when it's read.
+		// See https://github.com/kubernetes/kubernetes/issues/93902
+		attachState := rc.actualStateOfWorld.GetAttachState(volumeToAttach.VolumeName, volumeToAttach.NodeName)
+		if attachState == cache.AttachStateAttached {
 			// Volume/Node exists, touch it to reset detachRequestedTime
-			if klog.V(5) {
+			if klog.V(5).Enabled() {
 				klog.Infof(volumeToAttach.GenerateMsgDetailed("Volume attached--touching", ""))
 			}
 			rc.actualStateOfWorld.ResetDetachRequestTime(volumeToAttach.VolumeName, volumeToAttach.NodeName)
 			continue
 		}
-		// Don't even try to start an operation if there is already one running
-		if rc.attacherDetacher.IsOperationPending(volumeToAttach.VolumeName, "") {
-			if klog.V(10) {
-				klog.Infof("Operation for volume %q is already running. Can't start attach for %q", volumeToAttach.VolumeName, volumeToAttach.NodeName)
-			}
-			continue
-		}
 
-		if rc.isMultiAttachForbidden(volumeToAttach.VolumeSpec) {
+		if !util.IsMultiAttachAllowed(volumeToAttach.VolumeSpec) {
 			nodes := rc.actualStateOfWorld.GetNodesForAttachedVolume(volumeToAttach.VolumeName)
 			if len(nodes) > 0 {
 				if !volumeToAttach.MultiAttachErrorReported {
@@ -280,7 +296,7 @@ func (rc *reconciler) attachDesiredVolumes() {
 		}
 
 		// Volume/Node doesn't exist, spawn a goroutine to attach it
-		if klog.V(5) {
+		if klog.V(5).Enabled() {
 			klog.Infof(volumeToAttach.GenerateMsgDetailed("Starting attacherDetacher.AttachVolume", ""))
 		}
 		err := rc.attacherDetacher.AttachVolume(volumeToAttach.VolumeToAttach, rc.actualStateOfWorld)
@@ -325,7 +341,7 @@ func (rc *reconciler) reportMultiAttachError(volumeToAttach cache.VolumeToAttach
 		// Log detailed message to system admin
 		nodeList := strings.Join(otherNodesStr, ", ")
 		detailedMsg := volumeToAttach.GenerateMsgDetailed("Multi-Attach error", fmt.Sprintf("Volume is already exclusively attached to node %s and can't be attached to another", nodeList))
-		klog.Warningf(detailedMsg)
+		klog.Warning(detailedMsg)
 		return
 	}
 

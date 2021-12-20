@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/endpoints/openapi"
 	"k8s.io/apiserver/pkg/features"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
@@ -37,9 +38,11 @@ import (
 	"k8s.io/sample-apiserver/pkg/apiserver"
 	clientset "k8s.io/sample-apiserver/pkg/generated/clientset/versioned"
 	informers "k8s.io/sample-apiserver/pkg/generated/informers/externalversions"
+	sampleopenapi "k8s.io/sample-apiserver/pkg/generated/openapi"
+	netutils "k8s.io/utils/net"
 )
 
-const defaultEtcdPathPrefix = "/registry/wardle.kubernetes.io"
+const defaultEtcdPathPrefix = "/registry/wardle.example.com"
 
 // WardleServerOptions contains state for master/api server
 type WardleServerOptions struct {
@@ -56,7 +59,6 @@ func NewWardleServerOptions(out, errOut io.Writer) *WardleServerOptions {
 		RecommendedOptions: genericoptions.NewRecommendedOptions(
 			defaultEtcdPathPrefix,
 			apiserver.Codecs.LegacyCodec(v1alpha1.SchemeGroupVersion),
-			genericoptions.NewProcessInfo("wardle-apiserver", "wardle"),
 		),
 
 		StdOut: out,
@@ -106,7 +108,7 @@ func (o *WardleServerOptions) Complete() error {
 	// register admission plugins
 	banflunder.Register(o.RecommendedOptions.Admission.Plugins)
 
-	// add admisison plugins to the RecommendedPluginOrder
+	// add admission plugins to the RecommendedPluginOrder
 	o.RecommendedOptions.Admission.RecommendedPluginOrder = append(o.RecommendedOptions.Admission.RecommendedPluginOrder, "BanFlunder")
 
 	return nil
@@ -115,7 +117,7 @@ func (o *WardleServerOptions) Complete() error {
 // Config returns config for the api server given WardleServerOptions
 func (o *WardleServerOptions) Config() (*apiserver.Config, error) {
 	// TODO have a "real" external address
-	if err := o.RecommendedOptions.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{net.ParseIP("127.0.0.1")}); err != nil {
+	if err := o.RecommendedOptions.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{netutils.ParseIPSloppy("127.0.0.1")}); err != nil {
 		return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
 	}
 
@@ -132,6 +134,11 @@ func (o *WardleServerOptions) Config() (*apiserver.Config, error) {
 	}
 
 	serverConfig := genericapiserver.NewRecommendedConfig(apiserver.Codecs)
+
+	serverConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(sampleopenapi.GetOpenAPIDefinitions, openapi.NewDefinitionNamer(apiserver.Scheme))
+	serverConfig.OpenAPIConfig.Info.Title = "Wardle"
+	serverConfig.OpenAPIConfig.Info.Version = "0.1"
+
 	if err := o.RecommendedOptions.ApplyTo(serverConfig); err != nil {
 		return nil, err
 	}
